@@ -118,7 +118,7 @@ def load_chatgpt_passthrough_catalog_models(cache_path: Path | None = None) -> l
     path = Path(cache_path or DEFAULT_CODEX_MODELS_CACHE).expanduser()
     if path.exists():
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             data = None
         if isinstance(data, dict):
