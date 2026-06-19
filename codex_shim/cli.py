@@ -12,11 +12,8 @@ import shutil
 import subprocess
 import sys
 import time
-import hashlib
 import json
 import plistlib
-import re
-import struct
 from urllib.request import urlopen
 
 from . import router as router_module
@@ -49,6 +46,23 @@ from .opencode_go import (
     refresh_opencode_go_settings,
 )
 
+from codex_shim.desktop_patch import (
+    APP_ASAR_BACKUP_NAME,
+    INFO_PLIST_BACKUP_NAME,
+    MODEL_PICKER_NEEDLE,
+    MODEL_PICKER_REPLACEMENT,
+    MODEL_PICKER_APPLIED,
+    SIDEBAR_RECENT_THREADS_NEEDLE,
+    SIDEBAR_RECENT_THREADS_REPLACEMENT,
+    SIDEBAR_RECENT_THREADS_APPLIED,
+    _app_asar_hash,
+    _app_asar_header_hash,
+    _patch_codex_desktop_bundles,
+    _find_js_bundle,
+    _replace_once,
+    _read_text_lossy,
+    _app_asar_is_patched,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_DIR = PROJECT_ROOT / ".codex-shim"
@@ -65,32 +79,8 @@ WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 WINDOWS_STILL_ACTIVE = 259
 PREVIOUS_TOP_LEVEL_PREFIX = "# codex-shim previous-top-level = "
 MANAGED_TOP_LEVEL_KEYS = {"model", "model_provider", "model_catalog_json"}
-APP_ASAR_BACKUP_NAME = "app.asar.before-codex-shim-model-picker-patch"
-INFO_PLIST_BACKUP_NAME = "Info.plist.before-codex-shim-model-picker-patch"
 SYSTEM_CODEX_APP = Path("/Applications/Codex.app")
 USER_CODEX_APP = Path.home() / "Applications" / "Codex.app"
-MODEL_PICKER_NEEDLE = re.compile(
-    r"(?P<lhs>(?:let )?\w+=)"
-    r"(?:\w+\.useHiddenModels|\w+)"
-    r"&&\w+!==`amazonBedrock`"
-    r"(?P<sep>[,;])"
-)
-MODEL_PICKER_REPLACEMENT = r"\g<lhs>!1\g<sep>"
-MODEL_PICKER_APPLIED = re.compile(
-    r"(?:let )?\w+=!1[,;][^\n]{0,300}\.forEach"
-)
-
-SIDEBAR_RECENT_THREADS_NEEDLE = re.compile(
-    r"listRecentThreads\(\{cursor:e,limit:t(?:,useStateDbOnly:\w+(?:=!\d)?)?\}\)\{return this\.params\.requestClient\.sendRequest\(`thread/list`,"
-    r"\{limit:t,cursor:e,sortKey:this\.recentConversationSortKey,modelProviders:null,archived:!1,sourceKinds:(\w+)(?:,useStateDbOnly:\w+)?\}\)\}"
-)
-SIDEBAR_RECENT_THREADS_REPLACEMENT = (
-    r"listRecentThreads({cursor:e,limit:t}){return this.params.requestClient.sendRequest(`thread/list`,"
-    r"{limit:t,cursor:e,sortKey:this.recentConversationSortKey,modelProviders:[],archived:!1,sourceKinds:\1})}"
-)
-SIDEBAR_RECENT_THREADS_APPLIED = re.compile(
-    r"\.recentConversationSortKey,modelProviders:\[\],archived:!1,sourceKinds:\w+"
-)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -107,8 +97,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("restart")
     sub.add_parser("status")
     sub.add_parser("doctor", help="Print a read-only local diagnostics report.")
-    sub.add_parser("patch-app", help="Patch Codex Desktop picker/sidebar handling for custom shim models.")
-    sub.add_parser("restore-app", help="Restore Codex Desktop app.asar from the pre-patch backup.")
+    patch_app_parser = sub.add_parser("patch-app", help="Patch Codex Desktop model picker/sidebar to show custom shim models. On Windows, use --target for non-MSIX installs.")
+    patch_app_parser.add_argument("--target", type=str, default=None, help="Path to a non-MSIX Codex Desktop install directory (default: auto-detect)")
+    restore_app_parser = sub.add_parser("restore-app", help="Restore Codex Desktop app.asar from pre-patch backup. On Windows, use --target for non-MSIX installs.")
+    restore_app_parser.add_argument("--target", type=str, default=None, help="Path to a non-MSIX Codex Desktop install directory (default: auto-detect)")
 
     opencode_parser = sub.add_parser("opencode-go", help="Discover and configure OpenCode Go models.")
     opencode_sub = opencode_parser.add_subparsers(dest="opencode_go_command", required=True)
@@ -156,9 +148,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         return doctor(args.settings, args.port)
     if args.command == "patch-app":
-        return patch_codex_app()
+        return patch_codex_app(args)
     if args.command == "restore-app":
-        return restore_codex_app_bundle()
+        return restore_codex_app_bundle(args)
     if args.command == "opencode-go":
         if args.opencode_go_command == "refresh":
             return refresh_opencode_go(args.settings, args.api_key_env, args.base_url, args.prefer, args.timeout)
@@ -751,80 +743,253 @@ def _quit_codex_app() -> None:
         pass
 
 
-def patch_codex_app() -> int:
-    if sys.platform != "darwin":
-        print("patch-app is macOS-only; Windows MSIX Codex Desktop cannot be patched with this ASAR helper.", file=sys.stderr)
-        return 1
-    codex_app = _codex_app_bundle_for_patch()
-    app_asar = codex_app / "Contents/Resources/app.asar"
-    info_plist = codex_app / "Contents/Info.plist"
-    backup = RUNTIME_DIR / APP_ASAR_BACKUP_NAME
-    info_backup = RUNTIME_DIR / INFO_PLIST_BACKUP_NAME
+def patch_codex_app(args: argparse.Namespace | None = None) -> int:
+    if sys.platform == "darwin":
+        # === macOS branch (unchanged) ===
+        codex_app = _codex_app_bundle_for_patch()
+        app_asar = codex_app / "Contents/Resources/app.asar"
+        info_plist = codex_app / "Contents/Info.plist"
+        backup = RUNTIME_DIR / APP_ASAR_BACKUP_NAME
+        info_backup = RUNTIME_DIR / INFO_PLIST_BACKUP_NAME
 
-    if not app_asar.exists():
-        print(f"Codex app bundle not found at {codex_app}.", file=sys.stderr)
-        return 1
-    if codex_app == USER_CODEX_APP:
-        print(f"Patching user Codex copy at {codex_app}.")
-    if not info_plist.exists():
-        print(f"Codex Info.plist not found at {info_plist}.", file=sys.stderr)
-        return 1
-    if not _has_command("npx"):
-        print("npx is required to patch the Electron asar bundle.", file=sys.stderr)
+        if not app_asar.exists():
+            print(f"Codex app bundle not found at {codex_app}.", file=sys.stderr)
+            return 1
+        if codex_app == USER_CODEX_APP:
+            print(f"Patching user Codex copy at {codex_app}.")
+        if not info_plist.exists():
+            print(f"Codex Info.plist not found at {info_plist}.", file=sys.stderr)
+            return 1
+        if not _has_command("npx"):
+            print("npx is required to patch the Electron asar bundle.", file=sys.stderr)
+            return 1
+
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        if not backup.exists():
+            backup.write_bytes(app_asar.read_bytes())
+            print(f"Backed up original app.asar to {backup}.")
+        versioned_backup = RUNTIME_DIR / f"app.asar.before-codex-shim-model-picker-patch.{_app_asar_hash(app_asar)[:12]}"
+        if not versioned_backup.exists():
+            versioned_backup.write_bytes(app_asar.read_bytes())
+            print(f"Backed up current app.asar to {versioned_backup}.")
+        if not info_backup.exists():
+            info_backup.write_bytes(info_plist.read_bytes())
+            print(f"Backed up original Info.plist to {info_backup}.")
+
+        _quit_codex_app()
+        workdir = RUNTIME_DIR / "app-asar-work-user"
+        if workdir.exists():
+            import shutil
+
+            shutil.rmtree(workdir)
+        workdir.mkdir(parents=True)
+
+        subprocess.run(["npx", "--yes", "asar", "extract", str(app_asar), str(workdir)], check=True)
+        changed = _patch_codex_desktop_bundles(workdir)
+        if changed is None:
+            return 1
+        if changed:
+            subprocess.run(["npx", "--yes", "asar", "pack", str(workdir), str(app_asar)], check=True)
+            _update_app_asar_integrity(app_asar, info_plist)
+            _resign_codex_app(codex_app)
+        return 0
+
+    # === Windows/Linux branch ===
+    target = getattr(args, "target", None) if args else None
+    from codex_shim.desktop_patch.windows import (
+        find_codex_install,
+        is_msix_readonly,
+        quit_codex_app_windows,
+        update_app_asar_integrity_windows,
+        MODEL_PICKER_NEEDLE_WINDOWS,
+        MODEL_PICKER_REPLACEMENT_WINDOWS,
+        SIDEBAR_NEEDLE_WINDOWS,
+        SIDEBAR_REPLACEMENT_WINDOWS,
+    )
+    install_path = find_codex_install(target)
+    if install_path is None:
+        if target:
+            print(f"Codex Desktop not found at {target}", file=sys.stderr)
+        else:
+            print(
+                "Codex Desktop not found. If you have a portable/non-MSIX install, "
+                "use --target <path> to specify its location.",
+                file=sys.stderr,
+            )
         return 1
 
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    if not backup.exists():
-        backup.write_bytes(app_asar.read_bytes())
-        print(f"Backed up original app.asar to {backup}.")
-    versioned_backup = RUNTIME_DIR / f"app.asar.before-codex-shim-model-picker-patch.{_app_asar_hash(app_asar)[:12]}"
-    if not versioned_backup.exists():
-        versioned_backup.write_bytes(app_asar.read_bytes())
-        print(f"Backed up current app.asar to {versioned_backup}.")
-    if not info_backup.exists():
-        info_backup.write_bytes(info_plist.read_bytes())
-        print(f"Backed up original Info.plist to {info_backup}.")
+    if is_msix_readonly(install_path):
+        print(
+            "MSIX Codex Desktop install detected at:",
+            file=sys.stderr,
+        )
+        print(f"  {install_path}", file=sys.stderr)
+        print("This MSIX package is read-only and cannot be patched directly.", file=sys.stderr)
+        print(file=sys.stderr)
+        print("To use a portable Codex Desktop:", file=sys.stderr)
+        print("  1. Install vaportail/codex-windows-updater to extract a writable copy", file=sys.stderr)
+        print("  2. Run: codex-shim patch-app --target <path-to-extracted-copy>", file=sys.stderr)
+        return 1
 
-    _quit_codex_app()
-    workdir = RUNTIME_DIR / "app-asar-work-user"
-    if workdir.exists():
+    # --- Patch pipeline ---
+    # Determine ASAR path
+    asar_candidates = [
+        install_path / "resources" / "app.asar",
+        install_path / "app" / "app.asar",
+    ]
+    app_asar = next((p for p in asar_candidates if p.exists()), None)
+    if app_asar is None:
+        print(f"No app.asar found in {install_path}", file=sys.stderr)
+        return 1
+
+    # Check idempotency
+    if _app_asar_is_patched(app_asar):
+        print("Codex Desktop model picker patch is already applied.", file=sys.stderr)
+        return 0
+
+    # Quit Codex if running (non-fatal)
+    was_running = quit_codex_app_windows(force=True)
+    if was_running:
+        print("Stopped running Codex Desktop instance.")
+
+    # Create backup
+    backup_name = "app.asar.before-codex-shim-model-picker-patch"
+    backup_path = app_asar.with_name(backup_name)
+    if not backup_path.exists():
         import shutil
 
-        shutil.rmtree(workdir)
-    workdir.mkdir(parents=True)
+        shutil.copy2(app_asar, backup_path)
+        print(f"Backed up to {backup_path}")
+    else:
+        print(f"Backup already exists at {backup_path}")
 
-    subprocess.run(["npx", "--yes", "asar", "extract", str(app_asar), str(workdir)], check=True)
-    changed = _patch_codex_desktop_bundles(workdir)
-    if changed is None:
-        return 1
-    if changed:
-        subprocess.run(["npx", "--yes", "asar", "pack", str(workdir), str(app_asar)], check=True)
-        _update_app_asar_integrity(app_asar, info_plist)
-        _resign_codex_app(codex_app)
+    # Extract, patch, repack
+    import tempfile
+    import shutil
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Extract
+        extract_dir = Path(tmpdir) / "extracted"
+        subprocess.run(
+            ["npx", "--yes", "@electron/asar", "extract", str(app_asar), str(extract_dir)],
+            check=True, capture_output=True, text=True, timeout=60,
+        )
+
+        # Step A: Apply macOS-style patches (may hit nothing on Windows)
+        from codex_shim.desktop_patch import _patch_codex_desktop_bundles
+
+        _patch_codex_desktop_bundles(extract_dir)
+
+        # Step B: Apply Windows-specific picker patch
+        win_picker_count = 0
+        for js_file in extract_dir.rglob("*.js"):
+            text = js_file.read_text(encoding="utf-8", errors="replace")
+            if "useHiddenModels" not in text:
+                continue
+            new_text = MODEL_PICKER_NEEDLE_WINDOWS.sub(MODEL_PICKER_REPLACEMENT_WINDOWS, text)
+            if new_text != text:
+                js_file.write_text(new_text, encoding="utf-8")
+                win_picker_count += 1
+
+        # Step C: Apply Windows-specific sidebar patch
+        win_sidebar_count = 0
+        for js_file in extract_dir.rglob("*.js"):
+            text = js_file.read_text(encoding="utf-8", errors="replace")
+            if SIDEBAR_NEEDLE_WINDOWS not in text:
+                continue
+            new_text = text.replace(SIDEBAR_NEEDLE_WINDOWS, SIDEBAR_REPLACEMENT_WINDOWS)
+            if new_text != text:
+                js_file.write_text(new_text, encoding="utf-8")
+                win_sidebar_count += 1
+
+        print(f"Patched model picker ({win_picker_count} files).")
+        print(f"Patched sidebar thread list ({win_sidebar_count} files).")
+
+        # Repack
+        patched_asar = Path(tmpdir) / "app.asar.new"
+        subprocess.run(
+            ["npx", "--yes", "@electron/asar", "pack", str(extract_dir), str(patched_asar)],
+            check=True, capture_output=True, text=True, timeout=120,
+        )
+
+        # Replace original
+        shutil.copy2(patched_asar, app_asar)
+
+    # Update integrity (no-op on Windows)
+    update_app_asar_integrity_windows(app_asar, install_path)
+
+    print("Patched Codex Desktop model picker.")
     return 0
 
 
-def restore_codex_app_bundle() -> int:
-    if sys.platform != "darwin":
-        print("restore-app is macOS-only; Windows MSIX Codex Desktop cannot be restored with this ASAR helper.", file=sys.stderr)
-        return 1
-    codex_app = patched_codex_app_bundle() or _codex_app_bundle_for_patch()
-    app_asar = codex_app / "Contents/Resources/app.asar"
-    info_plist = codex_app / "Contents/Info.plist"
-    backup = RUNTIME_DIR / APP_ASAR_BACKUP_NAME
-    info_backup = RUNTIME_DIR / INFO_PLIST_BACKUP_NAME
-    if not backup.exists():
-        print(f"No app.asar backup found at {backup}.")
+def restore_codex_app_bundle(args: argparse.Namespace | None = None) -> int:
+    if sys.platform == "darwin":
+        # === macOS branch (unchanged) ===
+        codex_app = patched_codex_app_bundle() or _codex_app_bundle_for_patch()
+        app_asar = codex_app / "Contents/Resources/app.asar"
+        info_plist = codex_app / "Contents/Info.plist"
+        backup = RUNTIME_DIR / APP_ASAR_BACKUP_NAME
+        info_backup = RUNTIME_DIR / INFO_PLIST_BACKUP_NAME
+        if not backup.exists():
+            print(f"No app.asar backup found at {backup}.")
+            return 0
+        _quit_codex_app()
+        app_asar.write_bytes(backup.read_bytes())
+        if info_backup.exists():
+            info_plist.write_bytes(info_backup.read_bytes())
+            print(f"Restored {info_plist} from {info_backup}.")
+        elif info_plist.exists():
+            _update_app_asar_integrity(app_asar, info_plist)
+        _resign_codex_app(codex_app)
+        print(f"Restored {app_asar} from {backup}.")
         return 0
-    _quit_codex_app()
-    app_asar.write_bytes(backup.read_bytes())
-    if info_backup.exists():
-        info_plist.write_bytes(info_backup.read_bytes())
-        print(f"Restored {info_plist} from {info_backup}.")
-    elif info_plist.exists():
-        _update_app_asar_integrity(app_asar, info_plist)
-    _resign_codex_app(codex_app)
-    print(f"Restored {app_asar} from {backup}.")
+
+    # === Windows/Linux branch ===
+    target = getattr(args, "target", None) if args else None
+    from codex_shim.desktop_patch.windows import (
+        find_codex_install,
+        is_msix_readonly,
+    )
+    install_path = find_codex_install(target)
+    if install_path is None:
+        if target:
+            print(f"Codex Desktop not found at {target}", file=sys.stderr)
+        else:
+            print("Codex Desktop not found. Use --target to specify the install path.", file=sys.stderr)
+        return 1
+
+    if is_msix_readonly(install_path):
+        print(f"MSIX Codex Desktop at {install_path} is read-only.", file=sys.stderr)
+        print("Cannot restore. Use --target with a portable copy path.", file=sys.stderr)
+        return 1
+
+    # Find ASAR
+    asar_candidates = [
+        install_path / "resources" / "app.asar",
+        install_path / "app" / "app.asar",
+    ]
+    app_asar = next((p for p in asar_candidates if p.exists()), None)
+    if app_asar is None:
+        print(f"No app.asar found in {install_path}", file=sys.stderr)
+        return 1
+
+    # Find backup
+    backup_name = "app.asar.before-codex-shim-model-picker-patch"
+    backup_path = app_asar.with_name(backup_name)
+    if not backup_path.exists():
+        print(f"No backup found at {backup_path}. Cannot restore.", file=sys.stderr)
+        return 1
+
+    # Verify backup hash against current patched asar
+    if _app_asar_is_patched(app_asar):
+        import shutil
+
+        shutil.copy2(backup_path, app_asar)
+        print(f"Restored original app.asar from backup.")
+    else:
+        print("Current app.asar does not appear to be patched. No restore needed.", file=sys.stderr)
+        return 0
+
     return 0
 
 
@@ -832,21 +997,6 @@ def _has_command(command: str) -> bool:
     from shutil import which
 
     return which(command) is not None
-
-
-def _app_asar_hash(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def _app_asar_header_hash(path: Path) -> str:
-    with path.open("rb") as f:
-        _, _, _, json_size = struct.unpack("<4I", f.read(16))
-        header_json = f.read(json_size)
-    return hashlib.sha256(header_json).hexdigest()
 
 
 def _update_app_asar_integrity(app_asar: Path, info_plist: Path) -> None:
@@ -858,89 +1008,6 @@ def _update_app_asar_integrity(app_asar: Path, info_plist: Path) -> None:
         raise RuntimeError(f"Could not update ElectronAsarIntegrity in {info_plist}") from exc
     info_plist.write_bytes(plistlib.dumps(data))
     print("Updated ElectronAsarIntegrity for app.asar.")
-
-
-def _patch_codex_desktop_bundles(workdir: Path) -> bool | None:
-    patches = [
-        (
-            "model picker allowlist filter",
-            [
-                "models-and-reasoning-efforts-*.js",
-                "model-queries-*.js",
-                "*.js",
-            ],
-            MODEL_PICKER_NEEDLE,
-            MODEL_PICKER_REPLACEMENT,
-            MODEL_PICKER_APPLIED,
-        ),
-        (
-            "shim-mode sidebar provider filter",
-            ["app-server-manager-signals-*.js", "*.js"],
-            SIDEBAR_RECENT_THREADS_NEEDLE,
-            SIDEBAR_RECENT_THREADS_REPLACEMENT,
-            SIDEBAR_RECENT_THREADS_APPLIED,
-        ),
-    ]
-    changed = False
-    for label, globs, needle, replacement, applied in patches:
-        bundle_file = _find_js_bundle(workdir, globs, needle, applied)
-        if bundle_file is None:
-            print(f"Could not find the expected {label} in Codex Desktop.", file=sys.stderr)
-            return None
-        result = _replace_once(bundle_file, needle, replacement, applied)
-        if result is None:
-            print(f"Could not patch the expected {label} in Codex Desktop.", file=sys.stderr)
-            return None
-        if result:
-            changed = True
-            print(f"Patched Codex Desktop {label}.")
-        else:
-            print(f"Codex Desktop {label} patch is already applied.")
-    return changed
-
-
-def _find_js_bundle(
-    workdir: Path,
-    globs: list[str],
-    needle: re.Pattern[str],
-    applied: re.Pattern[str],
-) -> Path | None:
-    assets_dir = workdir / "webview" / "assets"
-    if not assets_dir.exists():
-        return None
-    candidates: list[Path] = []
-    for pattern in globs:
-        candidates.extend(p for p in sorted(assets_dir.glob(pattern)) if p not in candidates)
-    for path in candidates:
-        text = _read_text_lossy(path)
-        if needle.search(text) or applied.search(text):
-            return path
-    return None
-
-
-def _replace_once(
-    path: Path,
-    needle: re.Pattern[str],
-    replacement: str,
-    applied: re.Pattern[str],
-) -> bool | None:
-    text = _read_text_lossy(path)
-    matches = needle.findall(text)
-    if not matches:
-        if applied.search(text):
-            return False
-        return None
-    if len(matches) != 1:
-        return None
-    path.write_text(needle.sub(replacement, text, count=1))
-    return True
-
-
-def _read_text_lossy(path: Path) -> str:
-    try:
-        return path.read_text()
-    except UnicodeDecodeError:
-        return path.read_text(errors="ignore")
 
 
 def patched_codex_app_bundle() -> Path | None:
@@ -977,14 +1044,6 @@ def _path_is_writable(path: Path) -> bool:
             return True
     except OSError:
         return False
-
-
-def _app_asar_is_patched(app_asar: Path) -> bool:
-    try:
-        text = app_asar.read_bytes().decode("utf-8", errors="ignore")
-    except OSError:
-        return False
-    return MODEL_PICKER_APPLIED.search(text) is not None and SIDEBAR_RECENT_THREADS_APPLIED.search(text) is not None
 
 
 def _resign_codex_app(codex_app: Path = SYSTEM_CODEX_APP) -> None:

@@ -4,8 +4,11 @@ import json
 import hashlib
 import plistlib
 import struct
+from pathlib import Path
 
 import pytest
+
+from codex_shim.desktop_patch import windows as windows_module
 
 from codex_shim import cli
 from codex_shim.catalog import catalog_entry, write_catalog
@@ -470,16 +473,18 @@ def test_loopback_no_proxy_adds_upper_and_lowercase_entries():
 
 def test_patch_app_fails_off_macos(monkeypatch, capsys):
     monkeypatch.setattr(cli.sys, "platform", "win32")
+    monkeypatch.setattr("codex_shim.desktop_patch.windows.find_codex_install", lambda target=None: None)
 
     assert cli.patch_codex_app() == 1
-    assert "macOS-only" in capsys.readouterr().err
+    assert "Codex Desktop not found" in capsys.readouterr().err
 
 
 def test_restore_app_fails_off_macos(monkeypatch, capsys):
     monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setattr("codex_shim.desktop_patch.windows.find_codex_install", lambda target=None: None)
 
     assert cli.restore_codex_app_bundle() == 1
-    assert "macOS-only" in capsys.readouterr().err
+    assert "Codex Desktop not found" in capsys.readouterr().err
 
 
 def _make_picker_bundle(
@@ -593,6 +598,187 @@ def test_update_app_asar_integrity_uses_asar_json_header_hash(tmp_path):
 
     data = plistlib.loads(info_plist.read_bytes())
     assert data["ElectronAsarIntegrity"]["Resources/app.asar"]["hash"] == hashlib.sha256(header_json).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Windows patch detection and lifecycle tests
+# ---------------------------------------------------------------------------
+
+
+def test_find_codex_install_msix(monkeypatch):
+    """find_codex_install returns the MSIX path when MSIX install is detected."""
+    msix_path = Path("C:/Program Files/WindowsApps/OpenAI.Codex_1.0.0.0")
+    monkeypatch.setattr(windows_module, "_find_msix_install", lambda: msix_path)
+    monkeypatch.setattr(windows_module, "_find_msix_install_fallback", lambda: None)
+    monkeypatch.setattr(windows_module, "_get_local_appdata", lambda: None)
+
+    result = windows_module.find_codex_install()
+    assert result == msix_path
+
+
+def test_find_codex_install_target(tmp_path):
+    """find_codex_install returns the target path when it points to a valid install."""
+    (tmp_path / "Codex.exe").write_text("dummy")
+    resources = tmp_path / "resources"
+    resources.mkdir()
+    header = b'{"files":{"webview":{}}}'
+    (resources / "app.asar").write_bytes(
+        struct.pack("<4I", 4, len(header), 0, len(header)) + header
+    )
+
+    result = windows_module.find_codex_install(target=str(tmp_path))
+    assert result == tmp_path
+
+
+def test_find_codex_install_not_found(monkeypatch):
+    """find_codex_install returns None when no Codex install is found."""
+    monkeypatch.setattr(windows_module, "_find_msix_install", lambda: None)
+    monkeypatch.setattr(windows_module, "_find_msix_install_fallback", lambda: None)
+    monkeypatch.setattr(windows_module, "_get_local_appdata", lambda: None)
+
+    result = windows_module.find_codex_install()
+    assert result is None
+
+
+def test_is_msix_readonly_true():
+    """is_msix_readonly returns True for paths under WindowsApps."""
+    assert (
+        windows_module.is_msix_readonly(
+            Path("C:/Program Files/WindowsApps/OpenAI.Codex_1.0.0.0")
+        )
+        is True
+    )
+
+
+def test_is_msix_readonly_false(tmp_path):
+    """is_msix_readonly returns False for a regular writable path."""
+    assert windows_module.is_msix_readonly(tmp_path) is False
+
+
+def test_validate_codex_install_valid(tmp_path):
+    """validate_codex_install returns True for a properly structured Codex install."""
+    (tmp_path / "Codex.exe").write_text("dummy")
+    resources = tmp_path / "resources"
+    resources.mkdir()
+    header = b'{"files":{"webview":{}}}'
+    (resources / "app.asar").write_bytes(
+        struct.pack("<4I", 4, len(header), 0, len(header)) + header
+    )
+
+    assert windows_module.validate_codex_install(tmp_path) is True
+
+
+def test_validate_codex_install_invalid(tmp_path):
+    """validate_codex_install returns False for an empty/invalid directory."""
+    assert windows_module.validate_codex_install(tmp_path) is False
+
+
+def test_patch_app_windows_non_msix(monkeypatch, tmp_path, capsys):
+    """Patch pipeline succeeds on a non-MSIX Windows Codex install."""
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+
+    install_path = tmp_path / "Codex"
+    install_path.mkdir()
+    (install_path / "Codex.exe").write_text("dummy")
+    resources = install_path / "resources"
+    resources.mkdir()
+    header = b'{"files":{"webview":{}}}'
+    (resources / "app.asar").write_bytes(
+        struct.pack("<4I", 4, len(header), 0, len(header)) + header
+    )
+
+    monkeypatch.setattr(
+        "codex_shim.desktop_patch.windows.find_codex_install",
+        lambda target=None: install_path,
+    )
+    monkeypatch.setattr(
+        "codex_shim.desktop_patch.windows.is_msix_readonly", lambda path: False
+    )
+    monkeypatch.setattr(cli, "_app_asar_is_patched", lambda _: False)
+    monkeypatch.setattr(
+        "codex_shim.desktop_patch.windows.quit_codex_app_windows",
+        lambda force=True: False,
+    )
+    monkeypatch.setattr(
+        "codex_shim.desktop_patch.windows.update_app_asar_integrity_windows",
+        lambda a, b: None,
+    )
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *a, **kw: type("M", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+    )
+    monkeypatch.setattr("shutil.copy2", lambda s, d: None)
+
+    assert cli.patch_codex_app() == 0
+    assert "Patched Codex Desktop model picker" in capsys.readouterr().out
+
+
+def test_patch_app_windows_msix_refused(monkeypatch, capsys):
+    """Patch refuses when Codex is installed as a read-only MSIX package."""
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    msix_path = Path("C:/Program Files/WindowsApps/OpenAI.Codex_1.0.0.0")
+
+    monkeypatch.setattr(
+        "codex_shim.desktop_patch.windows.find_codex_install",
+        lambda target=None: msix_path,
+    )
+    monkeypatch.setattr(
+        "codex_shim.desktop_patch.windows.is_msix_readonly", lambda path: True
+    )
+
+    assert cli.patch_codex_app() == 1
+    assert "MSIX Codex Desktop install detected" in capsys.readouterr().err
+
+
+def test_restore_app_windows(monkeypatch, tmp_path, capsys):
+    """Restore succeeds on Windows when a pre-patch backup exists."""
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+
+    install_path = tmp_path / "Codex"
+    install_path.mkdir()
+    resources = install_path / "resources"
+    resources.mkdir()
+    app_asar = resources / "app.asar"
+    app_asar.write_text("patched content")
+    (resources / "app.asar.before-codex-shim-model-picker-patch").write_text(
+        "backup content"
+    )
+
+    monkeypatch.setattr(
+        "codex_shim.desktop_patch.windows.find_codex_install",
+        lambda target=None: install_path,
+    )
+    monkeypatch.setattr(
+        "codex_shim.desktop_patch.windows.is_msix_readonly", lambda path: False
+    )
+    monkeypatch.setattr(cli, "_app_asar_is_patched", lambda _: True)
+    monkeypatch.setattr("shutil.copy2", lambda s, d: None)
+
+    assert cli.restore_codex_app_bundle() == 0
+    assert "Restored original app.asar from backup" in capsys.readouterr().out
+
+
+def test_patch_app_windows_idempotent(monkeypatch, tmp_path, capsys):
+    """Patch reports already-applied when Windows Codex is already patched."""
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+
+    install_path = tmp_path / "Codex"
+    install_path.mkdir()
+    resources = install_path / "resources"
+    resources.mkdir()
+    (resources / "app.asar").write_text("content")
+
+    monkeypatch.setattr(
+        "codex_shim.desktop_patch.windows.find_codex_install",
+        lambda target=None: install_path,
+    )
+    monkeypatch.setattr(
+        "codex_shim.desktop_patch.windows.is_msix_readonly", lambda path: False
+    )
+    monkeypatch.setattr(cli, "_app_asar_is_patched", lambda _: True)
+
+    assert cli.patch_codex_app() == 0
+    assert "already applied" in capsys.readouterr().err.lower()
 
 
 class ModelSettingsFixture:
