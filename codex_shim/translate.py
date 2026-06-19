@@ -5,7 +5,40 @@ import re
 from typing import Any
 
 
-THINK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+# Known reasoning/thinking tag pairs used by various models.
+# Each tuple is (open_tag, close_tag). When adding new pairs here, keep
+# server.py's _think_tag_pairs (in ResponsesStreamState) in sync.
+THINK_TAG_PAIRS: list[tuple[str, str]] = [
+    # DeepSeek R1/V3, Qwen3, MiniMax M2/M2.5
+    ("<think>", "</think>"),
+    # MiniMax M3
+    ("<mm:think>", "</mm:think>"),
+    # Various models using full-word variants
+    ("<thinking>", "</thinking>"),
+    ("<reason>", "</reason>"),
+    ("<reasoning>", "</reasoning>"),
+    ("<thought>", "</thought>"),
+    # Bracket-style (some community models)
+    ("[THINK]", "[/THINK]"),
+    # Pipe-style Unicode (Kimi K2: \u25c1 = ◁, \u25b7 = ▷)
+    ("\u25c1think\u25b7", "\u25c1/think\u25b7"),
+]
+
+# Pre-compiled patterns: one per tag pair, group(1) = captured reasoning text.
+_THINK_PATTERNS: list[re.Pattern] = [
+    re.compile(re.escape(open_tag) + r"(.*?)" + re.escape(close_tag), re.IGNORECASE | re.DOTALL)
+    for open_tag, close_tag in THINK_TAG_PAIRS
+]
+
+# Legacy single-regex convenience for callers that just need tag removal.
+# Matches any known think tag pair with captured content in group(1) per pattern.
+_THINK_LEGACY = re.compile(
+    "|".join(
+        re.escape(open_tag) + r"(.*?)" + re.escape(close_tag)
+        for open_tag, close_tag in THINK_TAG_PAIRS
+    ),
+    re.IGNORECASE | re.DOTALL,
+)
 
 SHIM_ENCRYPTED_CONTENT_PREFIX = "anthropic-thinking-v1:"
 _THINKING_MAGIC = SHIM_ENCRYPTED_CONTENT_PREFIX
@@ -322,14 +355,14 @@ def chat_completion_to_response(payload: dict[str, Any], requested_model: str, t
     reasoning = message.get("reasoning_content") or message.get("reasoning")
     content_raw = message.get("content") or ""
 
-    # If no structured reasoning_content, check for <think> tags in content
+    # If no structured reasoning_content, check for think/reason tags in content
     if not reasoning:
-        think_match = THINK_RE.search(content_raw)
-        if think_match:
-            # Extract the reasoning text (strip <think> and </think>)
-            reasoning = think_match.group(0)[7:-8]
-            # Remove think tags from content
-            content_raw = THINK_RE.sub("", content_raw)
+        for pat in _THINK_PATTERNS:
+            think_match = pat.search(content_raw)
+            if think_match:
+                reasoning = think_match.group(1)
+                content_raw = pat.sub("", content_raw)
+                break
 
     if reasoning:
         output.append(
@@ -455,7 +488,7 @@ def _int_token(value: Any) -> int | None:
 
 
 def strip_think(text: str) -> str:
-    return THINK_RE.sub("", text or "")
+    return _THINK_LEGACY.sub("", text or "")
 
 
 def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:

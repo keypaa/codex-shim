@@ -1240,8 +1240,22 @@ class ResponsesStreamState:
         # emit the correct output item type (e.g. custom_tool_call for freeform
         # apply_patch instead of generic function_call).
         self.tool_types = tool_types or {}
-        # State for tracking <think> reasoning tags across streaming chunks
-        self._in_think_block = False
+        # Known reasoning/thinking tag pairs. Must match translate.py THINK_TAG_PAIRS.
+        # Used by _process_content_with_think to detect and extract reasoning
+        # blocks from streaming content deltas.
+        self._think_tag_pairs: list[tuple[str, str]] = [
+            ("<think>", "</think>"),
+            ("<mm:think>", "</mm:think>"),
+            ("<thinking>", "</thinking>"),
+            ("<reason>", "</reason>"),
+            ("<reasoning>", "</reasoning>"),
+            ("<thought>", "</thought>"),
+            ("[THINK]", "[/THINK]"),
+            ("\u25c1think\u25b7", "\u25c1/think\u25b7"),
+        ]
+        # When inside a think block across streaming chunks, stores the closing
+        # tag we're waiting for (e.g. "</think>"). None when not in a block.
+        self._in_think_block: str | None = None
         # Accumulated function_call_output items from server-side web search
         # execution, included in the final response.completed payload.
         self.web_search_results: list[dict[str, Any]] = []
@@ -1274,48 +1288,65 @@ class ResponsesStreamState:
                 await self._close_reasoning(response, state)
 
     async def _process_content_with_think(self, response: web.StreamResponse, content: str) -> None:
-        """Process a content delta, extracting <think> reasoning blocks.
+        """Extract reasoning blocks from streaming content deltas.
 
-        Upstream models sometimes emit reasoning as <think>...</think> XML
-        tags inside the content field of streaming chat-completion deltas.
-        This method parses those tags, sends the reasoning text via
-        _chat_reasoning_delta (proper ``reasoning_summary_text.delta`` events),
-        and sends only the non-think text as normal ``output_text.delta``.
+        Upstream models sometimes emit chain-of-thought reasoning as tagged
+        blocks inside the ``content`` field of streaming chat-completion deltas
+        (e.g. ``<think>...</think>``, ``<mm:think>...</mm:think>``,
+        ``<thinking>...</thinking>``, ``[THINK]...[/THINK]``,
+        ``\u25c1think\u25b7...\u25c1/think\u25b7``, etc.).
 
-        Tracks ``self._in_think_block`` across chunks for partial tags.
+        This method finds the earliest opening tag, sends the reasoning text
+        via ``_chat_reasoning_delta`` (proper ``reasoning_summary_text.delta``
+        SSE events), and sends only the non-reasoning text as normal
+        ``output_text.delta`` events.
+
+        Tracks ``self._in_think_block`` (the close tag we are waiting for)
+        across streaming chunks so tags split across multiple deltas work.
         """
         remaining = content
+        pairs = self._think_tag_pairs
 
         while remaining:
-            if self._in_think_block:
-                # Inside a <think> block — look for the closing tag
-                closing_idx = remaining.find("</think>")
+            if self._in_think_block is not None:
+                # Inside a think block — look for its closing tag
+                closing_tag = self._in_think_block
+                closing_idx = remaining.find(closing_tag)
                 if closing_idx >= 0:
                     think_text = remaining[:closing_idx]
                     if think_text:
                         await self._chat_reasoning_delta(response, think_text)
-                    self._in_think_block = False
+                    self._in_think_block = None
                     # Reasoning block is done — close it before any text
                     await self._close_open_reasoning(response)
-                    remaining = remaining[closing_idx + len("</think>"):]
+                    remaining = remaining[closing_idx + len(closing_tag):]
                     # Continue loop (may be more think tags or text)
                 else:
                     # Still inside — send as reasoning delta
                     await self._chat_reasoning_delta(response, remaining)
                     return
             else:
-                # Outside a <think> block — look for the opening tag
-                opening_idx = remaining.find("<think>")
-                if opening_idx >= 0:
-                    if opening_idx > 0:
-                        # Close any open reasoning before sending regular text
+                # Outside any think block — look for the earliest opening tag
+                best_pos = len(remaining) + 1
+                best_open: str | None = None
+                best_close: str | None = None
+                for open_tag, close_tag in pairs:
+                    pos = remaining.find(open_tag)
+                    if pos >= 0 and pos < best_pos:
+                        best_pos = pos
+                        best_open = open_tag
+                        best_close = close_tag
+
+                if best_open is not None:
+                    if best_pos > 0:
+                        # Text before the opening tag — send as normal text
                         await self._close_open_reasoning(response)
-                        await self._text_delta(response, remaining[:opening_idx])
-                    self._in_think_block = True
-                    remaining = remaining[opening_idx + len("<think>"):]
-                    # Continue loop to check for </think> immediately
+                        await self._text_delta(response, remaining[:best_pos])
+                    self._in_think_block = best_close
+                    remaining = remaining[best_pos + len(best_open):]
+                    # Continue loop to check for the close tag immediately
                 else:
-                    # No <think> tag — send as regular text
+                    # No opening tag — send everything as normal text
                     if remaining:
                         await self._close_open_reasoning(response)
                         await self._text_delta(response, remaining)
