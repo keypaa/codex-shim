@@ -845,6 +845,12 @@ def patch_codex_app(args: argparse.Namespace | None = None) -> int:
     if was_running:
         print("Stopped running Codex Desktop instance.")
 
+    # Check npx availability before doing anything
+    _npx = "npx.cmd" if sys.platform == "win32" else "npx"
+    if not _has_command(_npx):
+        print(f"{_npx} is required to patch the Electron asar bundle.", file=sys.stderr)
+        return 1
+
     # Create backup
     backup_name = "app.asar.before-codex-shim-model-picker-patch"
     backup_path = app_asar.with_name(backup_name)
@@ -864,7 +870,7 @@ def patch_codex_app(args: argparse.Namespace | None = None) -> int:
         # Extract
         extract_dir = Path(tmpdir) / "extracted"
         subprocess.run(
-            ["npx", "--yes", "@electron/asar", "extract", str(app_asar), str(extract_dir)],
+            [_npx, "--yes", "@electron/asar", "extract", str(app_asar), str(extract_dir)],
             check=True, capture_output=True, text=True, timeout=60,
         )
 
@@ -899,7 +905,7 @@ def patch_codex_app(args: argparse.Namespace | None = None) -> int:
         # Repack
         patched_asar = Path(tmpdir) / "app.asar.new"
         subprocess.run(
-            ["npx", "--yes", "@electron/asar", "pack", str(extract_dir), str(patched_asar)],
+            [_npx, "--yes", "@electron/asar", "pack", str(extract_dir), str(patched_asar)],
             check=True, capture_output=True, text=True, timeout=120,
         )
 
