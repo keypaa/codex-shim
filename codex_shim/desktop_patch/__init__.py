@@ -22,6 +22,7 @@ __all__ = [
     "SIDEBAR_RECENT_THREADS_NEEDLE",
     "SIDEBAR_RECENT_THREADS_REPLACEMENT",
     "SIDEBAR_RECENT_THREADS_APPLIED",
+    "SIDEBAR_APPLIED_WINDOWS",
     "_app_asar_hash",
     "_app_asar_header_hash",
     "_patch_codex_desktop_bundles",
@@ -59,6 +60,12 @@ SIDEBAR_RECENT_THREADS_REPLACEMENT = (
 )
 SIDEBAR_RECENT_THREADS_APPLIED = re.compile(
     r"\.recentConversationSortKey,modelProviders:\[\],archived:!1,sourceKinds:\w+"
+)
+
+# Windows sidebar uses listAllThreads (not listRecentThreads like macOS).
+# After patching, modelProviders:null becomes modelProviders:[] or modelProviders: [].
+SIDEBAR_APPLIED_WINDOWS = re.compile(
+    r"listAllThreads\(\{[^}]*modelProviders:\s*\["
 )
 
 # ---------------------------------------------------------------------------
@@ -169,4 +176,7 @@ def _app_asar_is_patched(app_asar: Path) -> bool:
         text = app_asar.read_bytes().decode("utf-8", errors="ignore")
     except OSError:
         return False
-    return MODEL_PICKER_APPLIED.search(text) is not None and SIDEBAR_RECENT_THREADS_APPLIED.search(text) is not None
+    if MODEL_PICKER_APPLIED.search(text) is None:
+        return False
+    return (SIDEBAR_RECENT_THREADS_APPLIED.search(text) is not None
+            or SIDEBAR_APPLIED_WINDOWS.search(text) is not None)

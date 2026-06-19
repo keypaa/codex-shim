@@ -49,18 +49,9 @@ from .opencode_go import (
 from codex_shim.desktop_patch import (
     APP_ASAR_BACKUP_NAME,
     INFO_PLIST_BACKUP_NAME,
-    MODEL_PICKER_NEEDLE,
-    MODEL_PICKER_REPLACEMENT,
-    MODEL_PICKER_APPLIED,
-    SIDEBAR_RECENT_THREADS_NEEDLE,
-    SIDEBAR_RECENT_THREADS_REPLACEMENT,
-    SIDEBAR_RECENT_THREADS_APPLIED,
     _app_asar_hash,
     _app_asar_header_hash,
     _patch_codex_desktop_bundles,
-    _find_js_bundle,
-    _replace_once,
-    _read_text_lossy,
     _app_asar_is_patched,
 )
 
@@ -526,7 +517,7 @@ def generate(settings_path: Path, port: int) -> None:
     write_catalog(models, CATALOG_PATH, router_config=router_config)
     write_config(models, CONFIG_PATH, CATALOG_PATH, port)
     print(f"Generated {len(models)} model entries:")
-    if _active_router(models, settings_path) is not None:
+    if router_config is not None and _active_router(models, settings_path) is not None:
         print(f"  auto router: {router_config.slug} ({router_config.display_name})")
     print(f"  catalog: {CATALOG_PATH}")
     print(f"  config:  {CONFIG_PATH}")
@@ -649,6 +640,8 @@ def stop() -> int:
     if not _pid_running(pid):
         print("Shim is not running.")
         PID_PATH.unlink(missing_ok=True)
+        return 0
+    if pid is None:
         return 0
     _terminate_pid(pid)
     for _ in range(50):
@@ -876,8 +869,6 @@ def patch_codex_app(args: argparse.Namespace | None = None) -> int:
         )
 
         # Step A: Apply macOS-style patches (may hit nothing on Windows)
-        from codex_shim.desktop_patch import _patch_codex_desktop_bundles
-
         _patch_codex_desktop_bundles(extract_dir)
 
         # Step B: Apply Windows-specific picker patch

@@ -8,7 +8,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncGenerator
 from urllib.parse import urljoin
 
 from aiohttp import ClientSession, ClientTimeout, web
@@ -822,11 +822,13 @@ class ShimServer:
     ) -> web.StreamResponse:
         response = _sse_response()
         await response.prepare(request)
+        state = None
         if as_responses:
             tool_types = _build_tool_types(body) if body else {}
             state = ResponsesStreamState(route.slug, tool_types)
         try:
             if as_responses:
+                assert state is not None
                 await state.start(response)
             async for line in _sse_lines(upstream):
                 if line == "[DONE]":
@@ -836,10 +838,12 @@ class ShimServer:
                 except json.JSONDecodeError:
                     continue
                 if as_responses:
+                    assert state is not None
                     await state.write_chat_delta(response, event)
                 else:
                     await _write_sse(response, event)
             if as_responses:
+                assert state is not None
                 await state.finish(response)
             else:
                 await _safe_write(response, b"data: [DONE]\n\n")
@@ -885,11 +889,13 @@ class ShimServer:
     ) -> web.StreamResponse:
         response = _sse_response()
         await response.prepare(request)
+        state = None
         if as_responses:
             tool_types = _build_tool_types(body) if body else {}
             state = ResponsesStreamState(route.slug, tool_types)
         try:
             if as_responses:
+                assert state is not None
                 await state.start(response)
             async for line in _sse_lines(upstream):
                 if line == "[DONE]":
@@ -899,10 +905,12 @@ class ShimServer:
                 except json.JSONDecodeError:
                     continue
                 if as_responses:
+                    assert state is not None
                     await state.write_anthropic_delta(response, event)
                 else:
                     await _write_sse(response, _anthropic_stream_to_chat_chunk(event, route.slug))
             if as_responses:
+                assert state is not None
                 await state.finish(response)
             else:
                 await _safe_write(response, b"data: [DONE]\n\n")
@@ -1225,7 +1233,7 @@ class ResponsesStreamState:
         self.message_opened = False
         self.message_closed = False
         self.usage: dict[str, Any] | None = None
-        self.tool_calls: dict[int, dict[str, Any]] = {}
+        self.tool_calls: dict[int | tuple[str, int], dict[str, Any]] = {}
         self.reasoning_blocks: dict[Any, dict[str, Any]] = {}
         self.next_output_index = 0
         # Map sanitized tool name -> original Responses tool type so we can
@@ -1813,9 +1821,9 @@ async def _perform_web_search(query: str) -> str:
         def _current_class(self) -> str:
             return self._class_stack[-1] if self._class_stack else ""
 
-        def handle_starttag(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> None:
-            attrs = dict(attrs_list)
-            cls = (attrs.get("class") or "").lower()
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            attr_dict = dict(attrs)
+            cls = (attr_dict.get("class") or "").lower()
             self._tag_stack.append(tag)
             self._class_stack.append(cls)
             if "result" in cls and tag == "div":
@@ -2063,7 +2071,7 @@ def _log_incoming_request(endpoint: str, body: dict[str, Any]) -> None:
         print(f"[req] failed to log: {exc}", flush=True)
 
 
-async def _sse_lines(upstream) -> Any:
+async def _sse_lines(upstream) -> AsyncGenerator[str, None]:
     buffer = b""
     async for chunk in upstream.content.iter_chunked(4096):
         buffer += chunk
@@ -2105,7 +2113,7 @@ def _default_compact_instructions() -> str:
     )
 
 
-async def _as_compact_response(response: web.StreamResponse, model: str) -> web.Response:
+async def _as_compact_response(response: web.StreamResponse, model: str) -> web.StreamResponse:
     if not isinstance(response, web.Response) or response.status >= 400:
         return response
     try:
