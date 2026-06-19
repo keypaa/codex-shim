@@ -1927,6 +1927,13 @@ def _build_tool_types(body: dict[str, Any]) -> dict[str, str]:
         clean = re.sub(r"[^a-zA-Z0-9_-]+", "_", name.strip())[:64].strip("_")
         if clean:
             tool_types[clean] = tool_type
+            # Native tools (web_search_preview, computer_use_preview) are
+            # renamed during responses_to_chat() translation (e.g. to the
+            # function name "web_search").  Also map the translated name so
+            # _open_tool and chat_completion_to_response can look up the
+            # original type when the upstream model responds with it.
+            if tool_type.startswith("web_search") and clean != "web_search":
+                tool_types["web_search"] = tool_type
     return tool_types
 
 async def _perform_web_search(query: str) -> str:
