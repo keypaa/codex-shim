@@ -51,6 +51,8 @@ from .translate import (
     chat_completion_to_response,
     chat_to_anthropic,
     normalize_responses_usage,
+    process_chat_completion_response,
+    process_chat_stream_chunk,
     responses_to_anthropic,
     responses_to_chat,
     _chat_finish_to_anthropic_stop,
@@ -765,6 +767,7 @@ class ShimServer:
             payload = chat_completion_to_response(payload, route.slug, tool_types)
             intercepted = _maybe_intercept_web_search(payload)
             return web.json_response(intercepted or payload)
+        process_chat_completion_response(payload)
         return web.json_response(payload)
 
     async def _post_openai_chat_as_anthropic(
@@ -823,6 +826,7 @@ class ShimServer:
         response = _sse_response()
         await response.prepare(request)
         state = None
+        think_state: dict[str, str | None] = {}  # shared across chunks for split tags
         if as_responses:
             tool_types = _build_tool_types(body) if body else {}
             state = ResponsesStreamState(route.slug, tool_types)
@@ -841,6 +845,7 @@ class ShimServer:
                     assert state is not None
                     await state.write_chat_delta(response, event)
                 else:
+                    process_chat_stream_chunk(event, think_state)
                     await _write_sse(response, event)
             if as_responses:
                 assert state is not None

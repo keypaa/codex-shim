@@ -491,6 +491,107 @@ def strip_think(text: str) -> str:
     return _THINK_LEGACY.sub("", text or "")
 
 
+def process_chat_stream_chunk(chunk: dict, state: dict[str, str | None]) -> dict:
+    """Strip think/reason tags from a streaming chat-completion chunk.
+
+    Handles tags that span multiple chunks using ``state["in_think_block"]``.
+    Sets ``delta.reasoning_content`` with the extracted reasoning text and
+    cleans ``delta.content``. Mutates *chunk* in place and returns it.
+
+    ``state`` should be a dict shared across calls (same HTTP stream). It is
+    mutated with the current block state.
+
+    Tag pairs used: ``THINK_TAG_PAIRS`` (supports ``<think>``, ``<mm:think>``,
+    ``<thinking>``, ``<reason>``, ``<reasoning>``, ``<thought>``, ``[THINK]``,
+    ``\u25c1think\u25b7``).
+    """
+    choices = chunk.get("choices") or []
+    if not choices:
+        return chunk
+    delta = choices[0].get("delta") or {}
+    raw = delta.get("content") or ""
+    if not raw:
+        return chunk
+
+    remaining = raw
+    reasoning_parts: list[str] = []
+    clean_parts: list[str] = []
+    in_block: str | None = state.get("in_think_block")
+    pairs = THINK_TAG_PAIRS
+
+    while remaining:
+        if in_block is not None:
+            close_tag = in_block
+            idx = remaining.find(close_tag)
+            if idx >= 0:
+                text = remaining[:idx]
+                if text:
+                    reasoning_parts.append(text)
+                in_block = None
+                remaining = remaining[idx + len(close_tag):]
+            else:
+                reasoning_parts.append(remaining)
+                remaining = ""
+        else:
+            best_pos = len(remaining) + 1
+            best_open: str | None = None
+            best_close: str | None = None
+            for open_tag, close_tag in pairs:
+                pos = remaining.find(open_tag)
+                if pos >= 0 and pos < best_pos:
+                    best_pos = pos
+                    best_open = open_tag
+                    best_close = close_tag
+            if best_open is not None:
+                if best_pos > 0:
+                    clean_parts.append(remaining[:best_pos])
+                in_block = best_close
+                remaining = remaining[best_pos + len(best_open):]
+            else:
+                if remaining:
+                    clean_parts.append(remaining)
+                remaining = ""
+
+    state["in_think_block"] = in_block
+
+    reasoning = "".join(reasoning_parts)
+    clean = "".join(clean_parts)
+
+    if reasoning:
+        existing = delta.get("reasoning_content") or ""
+        delta["reasoning_content"] = (existing + reasoning) if existing else reasoning
+    if clean:
+        delta["content"] = clean
+    elif "content" in delta:
+        # All content consumed by reasoning — remove content key
+        delta.pop("content", None)
+
+    return chunk
+
+
+def process_chat_completion_response(data: dict) -> dict:
+    """Strip think/reason tags from a non-streaming chat-completion response.
+
+    Extracts the first block of tagged reasoning text into
+    ``message.reasoning_content`` and removes the tags from
+    ``message.content``. If ``reasoning_content`` is already set, does nothing.
+    """
+    for choice in data.get("choices") or []:
+        message = choice.get("message") or {}
+        content = message.get("content") or ""
+        if not content:
+            continue
+        if message.get("reasoning_content") or message.get("reasoning"):
+            continue  # Already has structured reasoning
+        for pat in _THINK_PATTERNS:
+            m = pat.search(content)
+            if m:
+                message["reasoning_content"] = m.group(1)
+                message["content"] = pat.sub("", content)
+                break
+    return data
+
+
 def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
     if value is None:
         return []
