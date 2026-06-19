@@ -1621,6 +1621,75 @@ class ResponsesStreamState:
                 "item": self._tool_item(state, "completed"),
             },
         )
+        # Intercept web_search_call: execute search server-side and emit
+        # function_call_output — Codex Desktop will not execute the search
+        # itself for BYOK models (which advertise supports_search_tool: False).
+        if state.get("output_type") == "web_search_call":
+            await self._emit_web_search_result(response, state)
+
+    async def _emit_web_search_result(
+        self, response: web.StreamResponse, state: dict[str, Any]
+    ) -> None:
+        """Execute a web search server-side and emit a function_call_output item.
+
+        Called from _close_tool for web_search_call tools. Runs the search via
+        run_in_executor to avoid blocking the async event loop with the
+        synchronous urllib request in _perform_web_search.
+        """
+        import asyncio
+        import json
+
+        try:
+            args = json.loads(state.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            args = {}
+        query = args.get("query") or ""
+
+        # Run the synchronous web search (urllib) in a thread pool executor
+        # to avoid blocking the async event loop.
+        loop = asyncio.get_event_loop()
+        result_text = await loop.run_in_executor(
+            None, lambda q=query: asyncio.run(_perform_web_search(q))
+        )
+
+        output_index = self.next_output_index
+        self.next_output_index += 1
+        result_id = f"wso_{state['call_id']}_{int(time.time() * 1000)}"
+
+        result_item: dict[str, Any] = {
+            "id": result_id,
+            "type": "function_call_output",
+            "status": "completed",
+            "call_id": state["call_id"],
+            "output": result_text,
+            "output_index": output_index,
+        }
+        self.web_search_results.append(result_item)
+
+        # Emit response.output_item.added (placeholder with empty output)
+        await _write_sse(
+            response,
+            {
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {
+                    "id": result_id,
+                    "type": "function_call_output",
+                    "status": "in_progress",
+                    "call_id": state["call_id"],
+                    "output": "",
+                },
+            },
+        )
+        # Emit response.output_item.done (completed with actual search text)
+        await _write_sse(
+            response,
+            {
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": result_item,
+            },
+        )
 
     async def _open_reasoning(
         self,
@@ -1754,6 +1823,8 @@ class ResponsesStreamState:
                 collected.append((self.message_index, self._message_item("completed")))
             for state in self.tool_calls.values():
                 collected.append((state["output_index"], self._tool_item(state, "completed")))
+            for result in self.web_search_results:
+                collected.append((result["output_index"], result))
             collected.sort(key=lambda pair: pair[0])
             output = [item for _, item in collected]
         payload = {
