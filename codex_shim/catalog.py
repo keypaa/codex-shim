@@ -47,7 +47,7 @@ def catalog_entry(model: ShimModel) -> dict:
         "support_verbosity": False,
         "apply_patch_tool_type": "freeform",
         "web_search_tool_type": "text_and_image",
-        "supports_search_tool": False,
+        "supports_search_tool": True,
         "supports_parallel_tool_calls": True,
         "experimental_supported_tools": [],
         "input_modalities": ["text"] if model.no_image_support else ["text", "image"],

@@ -1658,8 +1658,8 @@ class ResponsesStreamState:
             },
         )
         # Intercept web_search_call: execute search server-side and emit
-        # function_call_output — Codex Desktop will not execute the search
-        # itself for BYOK models (which advertise supports_search_tool: False).
+        # function_call_output — the shim runs the search for BYOK models
+        # even though the catalog now advertises supports_search_tool: True.
         if state.get("output_type") == "web_search_call":
             await self._emit_web_search_result(response, state)
 
