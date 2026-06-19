@@ -416,14 +416,49 @@ def test_responses_to_anthropic_preserves_visual_feedback_as_image_blocks():
     ]
 
 
-def test_chat_completion_to_response_strips_think():
+def test_chat_completion_to_response_extracts_think():
     payload = {
         "id": "chatcmpl_1",
         "choices": [{"message": {"role": "assistant", "content": "<think>secret</think>Hello"}}],
     }
     out = chat_completion_to_response(payload, "slug")
     assert out["model"] == "slug"
-    assert out["output"][0]["content"][0]["text"] == "Hello"
+    # Reasoning should be extracted into a reasoning output item
+    assert out["output"][0]["type"] == "reasoning"
+    assert out["output"][0]["summary"][0]["text"] == "secret"
+    # Non-think text should be in the message output item
+    assert out["output"][1]["type"] == "message"
+    assert out["output"][1]["content"][0]["text"] == "Hello"
+
+
+def test_chat_completion_to_response_strips_think_no_text():
+    """When content is ONLY a <think> block with no text after it."""
+    payload = {
+        "id": "chatcmpl_2",
+        "choices": [{"message": {"role": "assistant", "content": "<think>only thinking</think>"}}],
+    }
+    out = chat_completion_to_response(payload, "slug")
+    assert out["output"][0]["type"] == "reasoning"
+    assert out["output"][0]["summary"][0]["text"] == "only thinking"
+    assert len(out["output"]) == 1  # no message item
+
+
+def test_chat_completion_to_response_think_reasoning_content_priority():
+    """reasoning_content field takes priority over <think> tags in content."""
+    payload = {
+        "id": "chatcmpl_3",
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "<think>ignored think</think>Hello",
+                "reasoning_content": "explicit reasoning",
+            }
+        }],
+    }
+    out = chat_completion_to_response(payload, "slug")
+    assert out["output"][0]["type"] == "reasoning"
+    assert out["output"][0]["summary"][0]["text"] == "explicit reasoning"
+    assert out["output"][1]["content"][0]["text"] == "<think>ignored think</think>Hello"  # content unchanged
 
 
 def test_chat_completion_to_response_normalizes_cached_usage():

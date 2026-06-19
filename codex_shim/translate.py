@@ -319,7 +319,18 @@ def chat_completion_to_response(payload: dict[str, Any], requested_model: str, t
     choice = (payload.get("choices") or [{}])[0]
     message = choice.get("message") or {}
     output: list[dict[str, Any]] = []
-    reasoning = message.get("reasoning_content")
+    reasoning = message.get("reasoning_content") or message.get("reasoning")
+    content_raw = message.get("content") or ""
+
+    # If no structured reasoning_content, check for <think> tags in content
+    if not reasoning:
+        think_match = THINK_RE.search(content_raw)
+        if think_match:
+            # Extract the reasoning text (strip <think> and </think>)
+            reasoning = think_match.group(0)[7:-8]
+            # Remove think tags from content
+            content_raw = THINK_RE.sub("", content_raw)
+
     if reasoning:
         output.append(
             {
@@ -329,15 +340,14 @@ def chat_completion_to_response(payload: dict[str, Any], requested_model: str, t
                 "summary": [{"type": "summary_text", "text": reasoning}],
             }
         )
-    text = strip_think(message.get("content") or "")
-    if text:
+    if content_raw:
         output.append(
             {
                 "id": "msg_0",
                 "type": "message",
                 "status": "completed",
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": text, "annotations": []}],
+                "content": [{"type": "output_text", "text": content_raw, "annotations": []}],
             }
         )
     tool_types = tool_types or {}
