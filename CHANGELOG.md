@@ -73,6 +73,10 @@ and this project does not yet follow semantic versioning (pre-1.0).
   `.codex-shim/last_request.json` to make strict-provider tokenization /
   schema errors easier to triage. Upstream error bodies are now logged with
   the model slug before being forwarded back.
+- `codex-shim patch-app` and `codex-shim restore-app` now support Windows
+  (non-MSIX Codex Desktop installs).
+- `--target` flag for `patch-app` and `restore-app` subcommands (point to
+  portable/vaportail-extracted Codex).
 
 ### Changed
 
@@ -83,6 +87,10 @@ and this project does not yet follow semantic versioning (pre-1.0).
 - Settings now prefer a generic top-level `models` array with snake_case keys,
   while still accepting `customModels` and camelCase aliases for existing
   exports.
+- Refactored ASAR patching helpers from `cli.py` into
+  `codex_shim/desktop_patch/` package.
+- `patch-codex-app` and `restore-app` now detect MSIX installs and show
+  actionable error with vaportail workaround.
 
 ### Fixed
 
@@ -108,6 +116,8 @@ and this project does not yet follow semantic versioning (pre-1.0).
 - `patch-app` now updates `ElectronAsarIntegrity` in `Info.plist` after
   repacking `app.asar`, and `restore-app` restores or recomputes that metadata
   before re-signing the app bundle.
+- Windows `patch-app` now uses corrected needle patterns for
+  model-list-filter and thread-context-inputs bundles (Phase 0 investigation).
 
 ## 2026-05-25 — Auth-gated ChatGPT passthrough + docs hardening
 
