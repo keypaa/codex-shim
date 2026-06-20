@@ -391,8 +391,6 @@ def chat_completion_to_response(payload: dict[str, Any], requested_model: str, t
         item_type = "function_call"
         if original_type == "apply_patch":
             item_type = "custom_tool_call"
-        elif original_type.startswith("web_search"):
-            item_type = "web_search_call"
         output.append(
             {
                 "id": call.get("id", "call_0"),

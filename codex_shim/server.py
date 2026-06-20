@@ -40,6 +40,7 @@ from .settings import (
     byok_model_has_credentials,
     chatgpt_upstream_model,
     is_chatgpt_passthrough_slug,
+    load_dotenv,
     usable_byok_models,
 )
 from .translate import (
@@ -58,6 +59,9 @@ from .translate import (
     _chat_finish_to_anthropic_stop,
     _responses_usage_to_anthropic_usage,
 )
+
+# Load ~/.codex-shim/.env into os.environ before any request handler runs.
+load_dotenv()
 
 DEBUG_DIR = Path(__file__).resolve().parents[1] / ".codex-shim"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
@@ -1609,8 +1613,6 @@ class ResponsesStreamState:
         output_type = "function_call"
         if original_type == "apply_patch":
             output_type = "custom_tool_call"
-        elif original_type.startswith("web_search"):
-            output_type = "web_search_call"
         state: dict[str, Any] = {
             "id": call_id,
             "call_id": call_id,
@@ -1657,10 +1659,12 @@ class ResponsesStreamState:
                 "item": self._tool_item(state, "completed"),
             },
         )
-        # Intercept web_search_call: execute search server-side and emit
-        # function_call_output — the shim runs the search for BYOK models
-        # even though the catalog now advertises supports_search_tool: True.
-        if state.get("output_type") == "web_search_call":
+        # Intercept web_search: execute search server-side and emit
+        # function_call_output — the shim runs the search for BYOK models.
+        # Detection is by tool name, not output_type, because we always
+        # emit function_call (not web_search_call) to avoid Codex Desktop
+        # ending the turn trying to handle it natively.
+        if state.get("name") == "web_search":
             await self._emit_web_search_result(response, state)
 
     async def _emit_web_search_result(
@@ -1668,7 +1672,7 @@ class ResponsesStreamState:
     ) -> None:
         """Execute a web search server-side and emit a function_call_output item.
 
-        Called from _close_tool for web_search_call tools. Runs the search via
+        Called from _close_tool when tool name is 'web_search'. Runs the search via
         run_in_executor to avoid blocking the async event loop with the
         synchronous urllib request in _perform_web_search.
         """
@@ -1936,127 +1940,219 @@ def _build_tool_types(body: dict[str, Any]) -> dict[str, str]:
                 tool_types["web_search"] = tool_type
     return tool_types
 
+def _format_search_results(results: list[dict[str, str]]) -> str:
+    """Format a list of ``{"title": ..., "url": ...}`` dicts into a text block."""
+    lines: list[str] = []
+    for r in results:
+        title = r.get("title", "").strip().replace("\n", " ")
+        url = r.get("url", "").strip()
+        if not title and not url:
+            continue
+        if title:
+            lines.append(title)
+        if url:
+            lines.append(url)
+    return "\n\n".join(lines) if lines else ""
+
+
+_LANGSEARCH_URL = "https://api.langsearch.com/v1/web-search"
+
+
+async def _run_langsearch(query: str, api_key: str) -> list[dict[str, str]] | None:
+    """Search via LangSearch API. Returns None on failure.
+
+    Note: count and summary params are intentionally omitted — they trigger
+    a server-side 500 error on the LangSearch API.
+    """
+    try:
+        async with ClientSession() as session:
+            async with session.post(
+                _LANGSEARCH_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"query": query},
+                timeout=ClientTimeout(total=20),
+            ) as resp:
+                resp.raise_for_status()
+                body = await resp.json()
+        # LangSearch wraps results under body["data"]["webPages"]["value"]
+        top_data = body.get("data") or {}
+        pages = (top_data.get("webPages") or {}).get("value") or []
+        return [
+            {"title": p.get("name", ""), "url": p.get("url", "")}
+            for p in pages
+            if p.get("name") and p.get("url")
+        ][:10]
+    except Exception:
+        return None
+
+
 async def _perform_web_search(query: str) -> str:
-    """Execute a web search via DuckDuckGo and return text results.
+    """Execute a web search via LangSearch (primary) or DuckDuckGo (fallback)
+    and return formatted text results.
 
     This is a server-side fallback for custom models whose provider does not
     have a native web-search capability.  Codex Desktop expects the shim to
-    return results as a `function_call_output` (or `web_search_call`) item;
-    when the model is BYOK, the Desktop app does not execute the search itself,
-    so the shim must do it and feed the results back into the conversation.
-    """
-    import urllib.parse
-    import urllib.request
+    return results as a ``function_call_output`` item; when the model is BYOK,
+    the Desktop app does not execute the search itself, so the shim must do it
+    and feed the results back into the conversation.
 
-    if not query or not query.strip():
+    Search provider priority:
+      1. LangSearch API (when ``LANGSEARCH_API_KEY`` env var is set)
+         https://langsearch.com — free tier: 1 000 queries/day, no credit card
+      2. DuckDuckGo via ddgs / primp / urllib (fallback)
+    """
+    import asyncio
+    import os
+
+    query = query.strip()
+    if not query:
         return "No search query provided."
 
-    # DuckDuckGo lite HTML endpoint (no API key required)
-    url = (
-        "https://html.duckduckgo.com/html/"
-        + "?q="
-        + urllib.parse.quote_plus(query.strip())
-    )
-    req = urllib.request.Request(
-        url,
-        headers={
+    # Strategy 0: LangSearch API (when LANGSEARCH_API_KEY is set)
+    api_key = os.environ.get("LANGSEARCH_API_KEY", "").strip()
+    if api_key:
+        try:
+            raw = await _run_langsearch(query, api_key)
+            if raw is not None:
+                formatted = _format_search_results(raw)
+                if formatted:
+                    return formatted
+        except Exception:
+            pass  # LangSearch failed; fall through to DuckDuckGo
+
+    # Strategy 1: Use ddgs library (handles TLS fingerprinting, proxy rotation)
+    try:
+        from ddgs import DDGS
+
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(
+            None, lambda: list(DDGS().text(query.strip(), max_results=5))
+        )
+        results: list[str] = []
+        for r in raw:
+            title = (r.get("title") or "").strip().replace("\n", " ")
+            snippet = (r.get("body") or "").strip().replace("\n", " ")
+            if title:
+                entry = title
+                if snippet:
+                    entry += "\n" + snippet
+                results.append(entry)
+        if results:
+            return "\n\n".join(results)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # Strategy 2: primp + regex parsing fallback
+    try:
+        import primp
+        import re
+
+        client = primp.Client(headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0.0.0 Safari/537.36"
-        },
-    )
+        })
+        url = f"https://lite.duckduckgo.com/lite/?q={__import__('urllib.parse').quote_plus(query.strip())}"
+
+        loop = asyncio.get_event_loop()
+        resp = await loop.run_in_executor(None, lambda: client.get(url))
+        html = resp.text
+
+        if "anomaly" not in html and "challenge-form" not in html:
+            results = []
+            for m in re.finditer(
+                r'<a[^>]*href="(//duckduckgo\.com/l/[^"]*)"[^>]*>(.*?)</a>',
+                html, re.DOTALL,
+            ):
+                title = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+                if not title:
+                    continue
+                after_link = html[m.end(): m.end() + 500]
+                snippet = ""
+                for snip_match in re.finditer(
+                    r'(?:<br\s*/?>\s*|\n\s*)([A-Z][^<]{10,300}?)(?:<|$)',
+                    after_link,
+                ):
+                    candidate = snip_match.group(1).strip()
+                    if candidate and len(candidate) > 10 and "//duckduckgo.com" not in candidate:
+                        snippet = candidate
+                        break
+                entry = title
+                if snippet:
+                    entry += "\n" + snippet
+                results.append(entry)
+                if len(results) >= 5:
+                    break
+            if results:
+                return "\n\n".join(results)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # Strategy 3: urllib + regex fallback
     try:
+        import re
+        import urllib.parse
+        import urllib.request
+
+        url = f"https://lite.duckduckgo.com/lite/?q={urllib.parse.quote_plus(query.strip())}"
+        ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/120.0.0.0 Safari/537.36")
+        req = urllib.request.Request(url, headers={"User-Agent": ua})
         with urllib.request.urlopen(req, timeout=10) as resp:
             html = resp.read().decode("utf-8", errors="replace")
+
+        if "anomaly" not in html and "challenge-form" not in html:
+            results = []
+            for m in re.finditer(
+                r'<a[^>]*href="(//duckduckgo\.com/l/[^"]*)"[^>]*>(.*?)</a>',
+                html, re.DOTALL,
+            ):
+                title = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+                if not title:
+                    continue
+                after_link = html[m.end(): m.end() + 500]
+                snippet = ""
+                for snip_match in re.finditer(
+                    r'(?:<br\s*/?>\s*|\n\s*)([A-Z][^<]{10,300}?)(?:<|$)',
+                    after_link,
+                ):
+                    candidate = snip_match.group(1).strip()
+                    if candidate and len(candidate) > 10 and "//duckduckgo.com" not in candidate:
+                        snippet = candidate
+                        break
+                entry = title
+                if snippet:
+                    entry += "\n" + snippet
+                results.append(entry)
+                if len(results) >= 5:
+                    break
+            if results:
+                return "\n\n".join(results)
     except Exception as exc:
         return f"Web search failed: {exc}"
 
-    # Extract title + snippet from result links
-    results: list[str] = []
-    # Each result is in a `.result` div with `.result__a` (title/link) and `.result__snippet`
-    from html.parser import HTMLParser
-
-    class _ResultParser(HTMLParser):
-        def __init__(self) -> None:
-            super().__init__()
-            self.in_result = False
-            self.in_a = False
-            self.in_snippet = False
-            self.current_title = ""
-            self.current_snippet = ""
-            self.results: list[dict[str, str]] = []
-            self._tag_stack: list[str] = []
-            self._class_stack: list[str] = []
-
-        def _current_class(self) -> str:
-            return self._class_stack[-1] if self._class_stack else ""
-
-        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-            attr_dict = dict(attrs)
-            cls = (attr_dict.get("class") or "").lower()
-            self._tag_stack.append(tag)
-            self._class_stack.append(cls)
-            if "result" in cls and tag == "div":
-                self.in_result = True
-                self.current_title = ""
-                self.current_snippet = ""
-            if self.in_result and tag == "a" and "result__a" in cls:
-                self.in_a = True
-            if self.in_result and ("result__snippet" in cls or "result__body" in cls):
-                self.in_snippet = True
-
-        def handle_endtag(self, tag: str) -> None:
-            if self._tag_stack and self._tag_stack[-1] == tag:
-                self._tag_stack.pop()
-                self._class_stack.pop()
-            if tag == "div" and self.in_result:
-                if self.current_title or self.current_snippet:
-                    self.results.append(
-                        {
-                            "title": self.current_title.strip(),
-                            "snippet": self.current_snippet.strip(),
-                        }
-                    )
-                self.in_result = False
-            if tag == "a":
-                self.in_a = False
-            if tag in {"div", "span", "p"}:
-                self.in_snippet = False
-
-        def handle_data(self, data: str) -> None:
-            if self.in_a:
-                self.current_title += data
-            if self.in_snippet:
-                self.current_snippet += data
-
-    parser = _ResultParser()
-    parser.feed(html)
-    for r in parser.results[:5]:
-        title = r["title"].replace("\n", " ")
-        snippet = r["snippet"].replace("\n", " ")
-        if title and snippet:
-            results.append(f"{title}\n{snippet}")
-        elif title:
-            results.append(title)
-        elif snippet:
-            results.append(snippet)
-
-    if not results:
-        return "No web search results found."
-    return "\n\n".join(results)
+    return "No web search results found."
 
 def _maybe_intercept_web_search(payload: dict[str, Any]) -> dict[str, Any] | None:
-    """If the response payload contains a web_search_call, execute it server-side
+    """If the response payload contains a web_search function_call, execute it server-side
     and return a new payload with the results embedded as a function_call_output.
 
-    Returns None if no web_search_call is present (pass through unchanged).
+    Returns None if no web_search function_call is present (pass through unchanged).
     """
     output = payload.get("output") or []
     if not isinstance(output, list):
         return None
     search_calls: list[tuple[int, dict[str, Any]]] = []
     for i, item in enumerate(output):
-        if isinstance(item, dict) and item.get("type") == "web_search_call":
+        if isinstance(item, dict) and item.get("name") == "web_search" and item.get("type") == "function_call":
             search_calls.append((i, item))
     if not search_calls:
         return None
@@ -2087,7 +2183,7 @@ def _maybe_intercept_web_search(payload: dict[str, Any]) -> dict[str, Any] | Non
     # Replace web_search_call items with their results
     new_output: list[dict[str, Any]] = []
     for i, item in enumerate(output):
-        if isinstance(item, dict) and item.get("type") == "web_search_call":
+        if isinstance(item, dict) and item.get("name") == "web_search" and item.get("type") == "function_call":
             # Find matching result
             for r in results:
                 if r.get("call_id") == item.get("call_id"):

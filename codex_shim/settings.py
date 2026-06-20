@@ -10,6 +10,7 @@ from typing import Any
 
 DEFAULT_SETTINGS = Path.home() / ".codex-shim" / "models.json"
 DEFAULT_CURSOR_API_KEY_FILE = Path.home() / ".codex-shim" / "cursor-api-key"
+DEFAULT_DOTENV_PATH = Path.home() / ".codex-shim" / ".env"
 DEFAULT_CODEX_AUTH = Path.home() / ".codex" / "auth.json"
 DEFAULT_CODEX_MODELS_CACHE = Path.home() / ".codex" / "models_cache.json"
 DEFAULT_HOST = "127.0.0.1"
@@ -34,6 +35,38 @@ FALLBACK_CHATGPT_DISPLAY_NAMES = {
     "gpt-5.2": "gpt-5.2",
     "codex-auto-review": "Codex Auto Review",
 }
+
+
+def load_dotenv(path: Path | None = None) -> Path | None:
+    """Load a ``KEY=VALUE`` env file into ``os.environ`` (does not overwrite existing).
+
+    Looks for ``~/.codex-shim/.env`` by default. Returns the path if loaded,
+    ``None`` if the file doesn't exist.
+    """
+    env_path = Path(path or DEFAULT_DOTENV_PATH).expanduser()
+    if not env_path.is_file():
+        return None
+    try:
+        raw = env_path.read_bytes()
+    except OSError:
+        return None
+    # Detect encoding by BOM: UTF-16 (0xFFFE or 0xFEFF) or UTF-8 w/ BOM (0xEFBBBF)
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        text = raw.decode("utf-16")
+    else:
+        text = raw.decode("utf-8-sig")
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip("\"'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+    return env_path
 
 
 def chatgpt_passthrough_available(auth_path: Path | None = None) -> bool:
