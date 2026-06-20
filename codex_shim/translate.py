@@ -60,7 +60,7 @@ def _decode_thinking_blob(encoded: Any) -> dict[str, Any] | None:
     return data
 
 
-def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, Any]:
+def responses_to_chat(body: dict[str, Any], upstream_model: str, provider: str = "") -> dict[str, Any]:
     messages = []
     instructions = body.get("instructions")
     if instructions:
@@ -88,7 +88,11 @@ def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, An
     _copy_if_present(body, chat, "top_p")
     _copy_if_present(body, chat, "max_output_tokens", "max_tokens")
     _copy_if_present(body, chat, "max_tokens")
-    _copy_if_present(body, chat, "parallel_tool_calls")
+    # parallel_tool_calls is only forwarded for native OpenAI providers;
+    # generic-compatible APIs (generic-chat-completion-api, ollama, etc.)
+    # may reject this parameter with a 422 error.
+    if provider == "openai":
+        _copy_if_present(body, chat, "parallel_tool_calls")
     _copy_if_present(body, chat, "reasoning_effort")
 
     tools = _responses_tools_to_chat_tools(body.get("tools"))

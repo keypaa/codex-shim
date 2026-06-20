@@ -268,7 +268,7 @@ class ShimServer:
             return await self._chatgpt_passthrough(request, body, response_model_override=model)
         route = self._route(body)
         if route.is_openai_chat:
-            forwarded = responses_to_chat(body, route.model)
+            forwarded = responses_to_chat(body, route.model, route.provider)
             return await self._post_openai_chat(request, route, forwarded, as_responses=True)
         if route.is_anthropic:
             forwarded = responses_to_anthropic(body, route.model, route.max_output_tokens)
@@ -300,7 +300,7 @@ class ShimServer:
         route = self._route(body)
         compact_body = _compact_request_body(body, route.model)
         if route.is_openai_chat:
-            forwarded = responses_to_chat(compact_body, route.model)
+            forwarded = responses_to_chat(compact_body, route.model, route.provider)
             forwarded["stream"] = False
             response = await self._post_openai_chat(request, route, forwarded, as_responses=True)
             return await _as_compact_response(response, route.slug)
