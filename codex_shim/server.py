@@ -2215,7 +2215,7 @@ def _join_url(base_url: str, endpoint: str) -> str:
 
 def _openai_headers(route: ShimModel) -> dict[str, str]:
     headers = {"Content-Type": "application/json", **route.extra_headers}
-    if route.api_key:
+    if route.api_key and not route.no_auth:
         headers.setdefault("Authorization", f"Bearer {route.api_key}")
     return headers
 
@@ -2226,7 +2226,7 @@ def _anthropic_headers(route: ShimModel) -> dict[str, str]:
         "anthropic-version": "2023-06-01",
         **route.extra_headers,
     }
-    if route.api_key:
+    if route.api_key and not route.no_auth:
         headers.setdefault("x-api-key", route.api_key)
     return headers
 

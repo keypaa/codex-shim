@@ -40,6 +40,10 @@ from .settings import (
     usable_byok_models,
     byok_model_has_credentials,
 )
+from .opencode_free import (
+    OPENCODE_FREE_BASE_URL,
+    refresh_opencode_free_settings,
+)
 from .opencode_go import (
     OPENCODE_GO_API_KEY_ENV,
     OPENCODE_GO_BASE_URL,
@@ -101,6 +105,12 @@ def main(argv: list[str] | None = None) -> int:
     refresh_parser.add_argument("--prefer", choices=["chat", "messages"], default="chat")
     refresh_parser.add_argument("--timeout", type=float, default=30.0)
 
+    opencode_free_parser = sub.add_parser("opencode-free", help="Discover and configure OpenCode Free models (no API key required).")
+    opencode_free_sub = opencode_free_parser.add_subparsers(dest="opencode_free_command", required=True)
+    free_refresh_parser = opencode_free_sub.add_parser("refresh", help="Refresh OpenCode Free models into the settings file.")
+    free_refresh_parser.add_argument("--base-url", default=OPENCODE_FREE_BASE_URL)
+    free_refresh_parser.add_argument("--timeout", type=float, default=30.0)
+
     model_parser = sub.add_parser("model", help="List or set the active shim model in Codex config.")
     model_sub = model_parser.add_subparsers(dest="model_command", required=True)
     model_sub.add_parser("list")
@@ -145,6 +155,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "opencode-go":
         if args.opencode_go_command == "refresh":
             return refresh_opencode_go(args.settings, args.api_key_env, args.base_url, args.prefer, args.timeout)
+    if args.command == "opencode-free":
+        if args.opencode_free_command == "refresh":
+            return refresh_opencode_free(args.settings, args.base_url, args.timeout)
     if args.command == "model":
         if args.model_command == "list":
             return list_models(args.settings)
@@ -543,7 +556,28 @@ def refresh_opencode_go(settings_path: Path, api_key_env: str, base_url: str, pr
         for model_id, chat_status, messages_status in result.skipped:
             print(f"  {model_id}: chat={chat_status}, messages={messages_status}")
     for row in result.models:
-        print(f"  {row['slug']}  ->  {row['model']} ({row['provider']}, {row['opencode_go_endpoint']})")
+        print(f"  {row['slug']}  ->  {row['model']} ({row['provider']})")
+    return 0
+
+
+def refresh_opencode_free(settings_path: Path, base_url: str, timeout: float) -> int:
+    print(f"Refreshing OpenCode Free models from {base_url}...")
+    try:
+        result = refresh_opencode_free_settings(
+            settings_path,
+            base_url=base_url,
+            timeout=timeout,
+        )
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"Refreshed {len(result.models)} OpenCode Free models into {result.settings_path}.")
+    if result.skipped:
+        print(f"Skipped {len(result.skipped)} models with no working probed endpoint:")
+        for model_id, chat_status, messages_status in result.skipped:
+            print(f"  {model_id}: chat={chat_status}, messages={messages_status}")
+    for row in result.models:
+        print(f"  {row['slug']}  ->  {row['model']} ({row['provider']})")
     return 0
 
 

@@ -12,6 +12,7 @@ from codex_shim.desktop_patch import windows as windows_module
 
 from codex_shim import cli
 from codex_shim.catalog import catalog_entry, write_catalog
+from codex_shim.opencode_free import opencode_free_model_row, write_opencode_free_models
 from codex_shim.opencode_go import opencode_go_model_row, write_opencode_go_models
 from codex_shim.settings import ModelSettings, chatgpt_passthrough_available, FALLBACK_CHATGPT_PASSTHROUGH_SLUGS
 
@@ -263,6 +264,163 @@ def test_refresh_opencode_go_cli_writes_discovered_models(monkeypatch, tmp_path,
         ("ocgo-glm-5-1", "generic-chat-completion-api"),
         ("ocgo-qwen3-7-max", "anthropic"),
     ]
+
+
+def test_opencode_free_model_row_prefers_chat_and_prefixes_slug():
+    row = opencode_free_model_row(
+        "gpt-5.3-codex",
+        chat_status=200,
+        messages_status=200,
+        base_url="https://opencode.ai/zen/v1",
+    )
+
+    assert row == {
+        "slug": "ocfree-gpt-5-3-codex",
+        "model": "gpt-5.3-codex",
+        "display_name": "OpenCode Free Gpt 5.3 Codex",
+        "provider": "generic-chat-completion-api",
+        "base_url": "https://opencode.ai/zen/v1",
+        "api_key": "",
+        "no_auth": True,
+        "no_image_support": True,
+        "generated_by": "codex-shim opencode-free refresh",
+    }
+
+
+def test_opencode_free_model_row_uses_messages_when_chat_fails():
+    row = opencode_free_model_row(
+        "qwen3.7-max",
+        chat_status=401,
+        messages_status=200,
+        base_url="https://opencode.ai/zen/v1",
+    )
+
+    assert row["slug"] == "ocfree-qwen3-7-max"
+    assert row["provider"] == "anthropic"
+    assert row["api_key"] == ""
+    assert row["no_auth"] is True
+
+
+def test_opencode_free_model_row_returns_none_when_both_endpoints_fail():
+    row = opencode_free_model_row(
+        "unknown-model",
+        chat_status=404,
+        messages_status=404,
+        base_url="https://opencode.ai/zen/v1",
+    )
+
+    assert row is None
+
+
+def test_write_opencode_free_models_replaces_previous_generated_rows(tmp_path):
+    settings = tmp_path / "models.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {"model": "manual", "provider": "openai", "base_url": "http://manual/v1", "api_key": "k"},
+                    {
+                        "slug": "ocfree-old",
+                        "model": "old",
+                        "provider": "generic-chat-completion-api",
+                        "base_url": "https://opencode.ai/zen/v1",
+                        "generated_by": "codex-shim opencode-free refresh",
+                    },
+                ]
+            }
+        )
+    )
+
+    write_opencode_free_models(
+        settings,
+        [
+            opencode_free_model_row(
+                "gpt-5.3-codex",
+                chat_status=200,
+                messages_status=200,
+                base_url="https://opencode.ai/zen/v1",
+            )
+        ],
+    )
+    models = ModelSettings(settings).load()
+
+    assert [model.slug for model in models] == ["manual", "ocfree-gpt-5-3-codex"]
+    assert [model.no_auth for model in models] == [False, True]
+
+
+def test_write_opencode_free_models_preserves_legacy_custom_models_key(tmp_path):
+    settings = tmp_path / "models.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "customModels": [
+                    {"model": "legacy", "provider": "openai", "baseUrl": "http://legacy/v1", "apiKey": "k"},
+                ]
+            }
+        )
+    )
+
+    write_opencode_free_models(
+        settings,
+        [
+            opencode_free_model_row(
+                "gpt-5.3-codex",
+                chat_status=200,
+                messages_status=200,
+                base_url="https://opencode.ai/zen/v1",
+            )
+        ],
+    )
+
+    on_disk = json.loads(settings.read_text())
+    assert "customModels" in on_disk
+    assert "models" not in on_disk
+    assert [row["model"] for row in on_disk["customModels"]] == ["legacy", "gpt-5.3-codex"]
+
+
+def test_refresh_opencode_free_cli_writes_discovered_models(monkeypatch, tmp_path, capsys):
+    settings = tmp_path / "models.json"
+    monkeypatch.setattr("codex_shim.opencode_free.fetch_opencode_free_model_ids", lambda *_args, **_kwargs: ["gpt-5.3-codex", "qwen3.7-max"])
+    monkeypatch.setattr("codex_shim.opencode_free.probe_chat_model", lambda _base, model, **_kwargs: 401 if model == "qwen3.7-max" else 200)
+    monkeypatch.setattr("codex_shim.opencode_free.probe_messages_model", lambda _base, _model, **_kwargs: 200)
+
+    assert cli.main(["--settings", str(settings), "opencode-free", "refresh"]) == 0
+
+    out = capsys.readouterr().out
+    assert "Refreshed 2 OpenCode Free models" in out
+    assert "ocfree-gpt-5-3-codex" in out
+    assert "ocfree-qwen3-7-max" in out
+    models = ModelSettings(settings).load()
+    assert [(model.slug, model.provider, model.no_auth, model.api_key) for model in models] == [
+        ("ocfree-gpt-5-3-codex", "generic-chat-completion-api", True, ""),
+        ("ocfree-qwen3-7-max", "anthropic", True, ""),
+    ]
+
+
+def test_opencode_free_model_with_no_auth_is_usable_without_api_key(tmp_path):
+    """OpenCode Free models have no_auth=True and empty api_key,
+    so byok_model_has_credentials should return True even though api_key is empty."""
+    settings = tmp_path / "models.json"
+    settings.write_text(
+        json.dumps({
+            "models": [{
+                "slug": "ocfree-gpt-5-3-codex",
+                "model": "gpt-5.3-codex",
+                "display_name": "OpenCode Free GPT 5.3 Codex",
+                "provider": "generic-chat-completion-api",
+                "base_url": "https://opencode.ai/zen/v1",
+                "api_key": "",
+                "no_auth": True,
+                "no_image_support": True,
+            }]
+        })
+    )
+
+    from codex_shim.settings import byok_model_has_credentials
+    [model] = ModelSettings(settings).load()
+    assert model.api_key == ""
+    assert model.no_auth is True
+    assert byok_model_has_credentials(model) is True
 
 
 def test_ollama_launch_models_schema_loads(tmp_path):
