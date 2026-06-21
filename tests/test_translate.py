@@ -220,14 +220,14 @@ def test_responses_to_chat_deepseek_v_thinking_type():
         "input": [{"role": "user", "content": "hello"}],
     }
     out = responses_to_chat(body, "deepseek-v4-pro")
-    assert out.get("extra_body", {}).get("thinking", {}).get("type") == "enabled"
+    assert out.get("thinking", {}).get("type") == "enabled"
 
     body_no_reasoning = {
         "model": "deepseek-v4-pro",
         "input": [{"role": "user", "content": "hello"}],
     }
     out2 = responses_to_chat(body_no_reasoning, "deepseek-v4-pro")
-    assert out2.get("extra_body", {}).get("thinking", {}).get("type") == "disabled"
+    assert out2.get("thinking", {}).get("type") == "disabled"
 
 
 def test_responses_to_chat_preserves_reasoning_and_effort_for_deepseek():

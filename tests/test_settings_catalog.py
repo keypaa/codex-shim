@@ -861,10 +861,15 @@ def test_patch_app_windows_non_msix(monkeypatch, tmp_path, capsys):
         "codex_shim.desktop_patch.windows.update_app_asar_integrity_windows",
         lambda a, b: None,
     )
-    monkeypatch.setattr(
-        "subprocess.run",
-        lambda *a, **kw: type("M", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
-    )
+    def _mock_subprocess(*a, **kw):
+        args = a[0] if a else kw.get("args", [])
+        if len(args) >= 6 and args[3] == "extract":
+            extract_dir = Path(args[5])
+            js_file = extract_dir / "test.js"
+            js_file.parent.mkdir(parents=True, exist_ok=True)
+            js_file.write_text("x = y && z !== `amazonBedrock`\nmodelProviders:null")
+        return type("M", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    monkeypatch.setattr("subprocess.run", _mock_subprocess)
     monkeypatch.setattr("shutil.copy2", lambda s, d: None)
 
     assert cli.patch_codex_app() == 0

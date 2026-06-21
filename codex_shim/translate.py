@@ -142,7 +142,7 @@ def responses_to_chat(body: dict[str, Any], upstream_model: str, provider: str =
     # the generated content isn't later forwarded.
     if upstream_model and ("deepseek-v" in upstream_model.lower()):
         thinking_enabled = chat.get("reasoning_effort") not in (None, "none")
-        chat.setdefault("extra_body", {})["thinking"] = {
+        chat["thinking"] = {
             "type": "enabled" if thinking_enabled else "disabled",
         }
 

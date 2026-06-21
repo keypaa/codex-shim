@@ -909,7 +909,7 @@ def patch_codex_app(args: argparse.Namespace | None = None) -> int:
         )
 
         # Step A: Apply macOS-style patches (may hit nothing on Windows)
-        _patch_codex_desktop_bundles(extract_dir)
+        mac_changed = _patch_codex_desktop_bundles(extract_dir) or False
 
         # Step B: Apply Windows-specific picker patch
         win_picker_count = 0
@@ -935,6 +935,10 @@ def patch_codex_app(args: argparse.Namespace | None = None) -> int:
 
         print(f"Patched model picker ({win_picker_count} files).")
         print(f"Patched sidebar thread list ({win_sidebar_count} files).")
+
+        if not mac_changed and win_picker_count == 0 and win_sidebar_count == 0:
+            print("No patches matched — the Codex Desktop bundle may have changed layout.", file=sys.stderr)
+            return 1
 
         # Repack
         patched_asar = Path(tmpdir) / "app.asar.new"

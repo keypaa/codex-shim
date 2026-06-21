@@ -770,10 +770,11 @@ class ShimServer:
         if as_responses:
             tool_types = _build_tool_types(body)
             payload = chat_completion_to_response(payload, route.slug, tool_types)
-            intercepted = _maybe_intercept_web_search(payload)
+            intercepted = await _maybe_intercept_web_search(payload)
             return web.json_response(intercepted or payload)
         process_chat_completion_response(payload)
         return web.json_response(payload)
+
 
     async def _post_openai_chat_as_anthropic(
         self, request: web.Request, route: ShimModel, body: dict[str, Any]
@@ -805,7 +806,7 @@ class ShimServer:
         if as_responses:
             tool_types = _build_tool_types(body)
             payload = anthropic_to_response(payload, route.slug, tool_types)
-            intercepted = _maybe_intercept_web_search(payload)
+            intercepted = await _maybe_intercept_web_search(payload)
             return web.json_response(intercepted or payload)
         return web.json_response(anthropic_to_chat_response(payload, route.slug))
 
@@ -2142,7 +2143,7 @@ async def _perform_web_search(query: str) -> str:
 
     return "No web search results found."
 
-def _maybe_intercept_web_search(payload: dict[str, Any]) -> dict[str, Any] | None:
+async def _maybe_intercept_web_search(payload: dict[str, Any]) -> dict[str, Any] | None:
     """If the response payload contains a web_search function_call, execute it server-side
     and return a new payload with the results embedded as a function_call_output.
 
@@ -2166,12 +2167,9 @@ def _maybe_intercept_web_search(payload: dict[str, Any]) -> dict[str, Any] | Non
         except json.JSONDecodeError:
             args = {}
         query = args.get("query") or ""
-        # Run the search synchronously (non-streaming path only)
-        import asyncio
         try:
-            loop = asyncio.get_running_loop()
-            result_text = loop.run_until_complete(_perform_web_search(query))
-        except RuntimeError:
+            result_text = await _perform_web_search(query)
+        except Exception:
             result_text = "Web search unavailable in this context."
         results.append({
             "id": f"wso_{call.get('call_id', '0')}",
