@@ -246,6 +246,7 @@ class ShimServer:
     async def responses(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
         _log_incoming_request("/v1/responses", body)
+        _dump_debug_request("inbound", "/v1/responses", body)
         body = await self._maybe_apply_auto_router(body)
         model = str(body.get("model") or "")
         if is_chatgpt_passthrough_slug(model):
@@ -2441,6 +2442,12 @@ async def _error_response(upstream, *, slug: str | None = None) -> web.Response:
             f"[err] upstream {slug} returned {upstream.status}: {text[:500]}",
             flush=True,
         )
+    try:
+        error_path = DEBUG_DIR / "last_error.json"
+        error_path.parent.mkdir(parents=True, exist_ok=True)
+        error_path.write_text(json.dumps({"status": upstream.status, "slug": slug, "body": text[:10000]}, indent=2))
+    except OSError as exc:
+        print(f"[err] failed to write last_error.json: {exc}", flush=True)
     return web.Response(status=upstream.status, text=text, content_type=upstream.content_type or "text/plain")
 
 

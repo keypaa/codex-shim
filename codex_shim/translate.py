@@ -66,18 +66,58 @@ def responses_to_chat(body: dict[str, Any], upstream_model: str, provider: str =
     if instructions:
         messages.append({"role": "system", "content": _content_to_text(instructions)})
     pending_reasoning: str | None = None
+    has_reasoning = False
     for m in _responses_input_to_messages(body.get("input")):
         if m.get("_reasoning_only"):
             summary = m.get("summary") or []
             text = " ".join(item.get("text", "") for item in summary if isinstance(item, dict))
             if text:
                 pending_reasoning = text
+                has_reasoning = True
             continue
         if pending_reasoning and m.get("role") == "assistant":
             m["reasoning_content"] = pending_reasoning
             pending_reasoning = None
         messages.append(m)
+    # If reasoning was never attached (e.g., the reasoning item came after
+    # tool call output items in the input), try retroactively attaching it
+    # to the last assistant message that has tool_calls.
+    if pending_reasoning:
+        for m in reversed(messages):
+            if m.get("role") == "assistant" and m.get("tool_calls") and not m.get("reasoning_content"):
+                m["reasoning_content"] = pending_reasoning
+                break
     messages = _sanitize_chat_messages(_merge_consecutive_messages(_normalize_chat_roles(messages)))
+
+    # Deduplicate tool messages by tool_call_id. The Responses API may include
+    # multiple function_call_output items for the same call (e.g., a text result
+    # followed by an "unsupported call" diagnostic). Chat Completions requires
+    # each tool_call_id to appear exactly once. Merge content into first.
+    seen_tool_ids: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for m in messages:
+        if m.get("role") == "tool" and m.get("tool_call_id"):
+            tci: str = m["tool_call_id"]
+            if tci in seen_tool_ids:
+                for existing in deduped:
+                    if existing.get("role") == "tool" and existing.get("tool_call_id") == tci:
+                        existing["content"] = _merge_chat_content(existing.get("content"), m.get("content"))
+                        break
+                continue
+            seen_tool_ids.add(tci)
+        deduped.append(m)
+    messages = deduped
+
+    # Propagate reasoning_content: if the conversation has reasoning items
+    # (model is in thinking mode), ensure ALL assistant messages with tool_calls
+    # have reasoning_content. DeepSeek V-series requires this for round-trips.
+    if has_reasoning:
+        last_rc: str | None = None
+        for m in messages:
+            if m.get("role") == "assistant" and m.get("reasoning_content"):
+                last_rc = m["reasoning_content"]
+            elif m.get("role") == "assistant" and m.get("tool_calls") and not m.get("reasoning_content") and last_rc:
+                m["reasoning_content"] = last_rc
 
     chat: dict[str, Any] = {
         "model": upstream_model,
@@ -94,6 +134,17 @@ def responses_to_chat(body: dict[str, Any], upstream_model: str, provider: str =
     if provider == "openai":
         _copy_if_present(body, chat, "parallel_tool_calls")
     _copy_if_present(body, chat, "reasoning_effort")
+
+    # DeepSeek V-series models (v4-pro, v4-flash, etc.) use "thinking.type"
+    # instead of OpenRouter's "reasoning" parameter. Without explicit control,
+    # thinking defaults to enabled, generating reasoning_content even when
+    # not requested, which can cause 400 errors on tool-call round-trips if
+    # the generated content isn't later forwarded.
+    if upstream_model and ("deepseek-v" in upstream_model.lower()):
+        thinking_enabled = chat.get("reasoning_effort") not in (None, "none")
+        chat.setdefault("extra_body", {})["thinking"] = {
+            "type": "enabled" if thinking_enabled else "disabled",
+        }
 
     tools = _responses_tools_to_chat_tools(body.get("tools"))
     if tools:
@@ -1291,15 +1342,21 @@ def _merge_consecutive_messages(messages: list[dict[str, Any]]) -> list[dict[str
     for message in messages:
         current = dict(message)
         role = current.get("role")
-        if merged and role == merged[-1].get("role") and role in {"system", "user", "assistant"}:
+        if merged and role == merged[-1].get("role") and role in {"system", "user", "assistant", "tool"}:
             previous = merged[-1]
-            previous["content"] = _merge_chat_content(previous.get("content"), current.get("content"))
-            if role == "assistant":
-                if current.get("reasoning_content") and not previous.get("reasoning_content"):
-                    previous["reasoning_content"] = current["reasoning_content"]
-                tool_calls = list(previous.get("tool_calls") or []) + list(current.get("tool_calls") or [])
-                if tool_calls:
-                    previous["tool_calls"] = tool_calls
+            if role == "tool":
+                if current.get("tool_call_id") == previous.get("tool_call_id"):
+                    previous["content"] = _merge_chat_content(previous.get("content"), current.get("content"))
+                else:
+                    merged.append(current)
+            else:
+                previous["content"] = _merge_chat_content(previous.get("content"), current.get("content"))
+                if role == "assistant":
+                    if current.get("reasoning_content") and not previous.get("reasoning_content"):
+                        previous["reasoning_content"] = current["reasoning_content"]
+                    tool_calls = list(previous.get("tool_calls") or []) + list(current.get("tool_calls") or [])
+                    if tool_calls:
+                        previous["tool_calls"] = tool_calls
             continue
         merged.append(current)
     return merged
