@@ -157,7 +157,7 @@ Use one of these setups:
 | WSL | Supported | Works like Linux. Best when Codex CLI/Desktop is also being driven from WSL. |
 | Git Bash | Supported | Works with the POSIX `bin/` wrappers if Python/Codex are on `PATH`. |
 | `bin/codex-app`, `bin/codex-model` in PowerShell/cmd | Not native | These are shell scripts. Use `codex-shim app ...` and `codex-shim model ...` instead. |
-| `patch-app` / `restore-app` | macOS only | They target `/Applications/Codex.app` and Electron ASAR signing on macOS. |
+| `patch-app` / `restore-app` | Windows + macOS | macOS: targets `/Applications/Codex.app` with ASAR signing. Windows: use `--target <path>` for non-MSIX installs (portable / vaportail-extracted). |
 
 Native Windows quick check:
 
@@ -198,7 +198,7 @@ Windows Store/MSIX Codex Desktop builds are stricter than the CLI. They may trea
 custom local/BYOK slugs as unavailable, rewrite `model = "<custom-slug>"` back to
 `gpt-5.5`, and add `[tui.model_availability_nux]` entries on launch. That is a
 Desktop allowlist behavior, not a shim routing behavior: `codex exec`, the TUI,
-and the shim endpoint still use the configured model slug. The macOS `patch-app`
+and the shim endpoint still use the configured model slug. The `patch-app`
 helper does not apply to MSIX packages under `C:\\Program Files\\WindowsApps`.
 
 If Windows has a system proxy such as Clash/V2Ray, make sure loopback bypasses it:
@@ -540,6 +540,48 @@ codex-shim restore-app
 
 If Codex still crashes after `patch-app`, restore with `codex-shim restore-app`
 and re-check the manual patch needles against the installed Desktop build.
+
+### Windows picker patch
+
+The same allowlist-hiding behavior affects non-MSIX Codex Desktop installs on
+Windows. The `--target` flag lets you point `patch-app` / `restore-app` at a
+portable or vaportail-extracted Codex Desktop installation.
+
+**Prerequisites:**
+- A non-MSIX Codex Desktop install (portable or vaportail-extracted).
+- Node.js with `npx` on `PATH` (used to run `@electron/asar`).
+
+**Usage:**
+
+```powershell
+codex-shim patch-app --target "C:\path\to\Codex\Codex.exe"
+codex-shim restore-app --target "C:\path\to\Codex\Codex.exe"
+```
+
+Without `--target`, the command auto-detects a non-MSIX install at common
+locations. Auto-detection that finds only MSIX packages exits with a clear error.
+
+**MSIX limitation.** Codex Desktop from the Microsoft Store is an MSIX package at
+`C:\Program Files\WindowsApps\`. Those directories are read-only and
+integrity-protected. The patch cannot modify files inside them; `patch-app`
+refuses to patch MSIX packages.
+
+**Vaportail workaround.** To patch an MSIX-installed Codex, use
+[vaportail](https://github.com/Spcya/codex-windows-updater) (codex-windows-updater)
+to extract a writable portable copy:
+
+```powershell
+vaportail extract --source "C:\Program Files\WindowsApps\OpenAI.Codex_*\Codex.exe" --target "D:\Codex-Portable"
+codex-shim patch-app --target "D:\Codex-Portable\Codex.exe"
+```
+
+**Troubleshooting:**
+- **"npx not found":** Install Node.js (`winget install OpenJS.NodeJS` or from
+  https://nodejs.org).
+- **"MSIX detected" error:** The target is an MSIX package or auto-detection
+  found one. Use the vaportail workaround above.
+- **Patch lost after Codex update:** Codex Desktop updates replace `app.asar`.
+  Re-run `codex-shim patch-app --target <path>` after each update.
 
 ---
 
@@ -898,8 +940,8 @@ codex-shim model list        list slugs currently usable in the picker
 codex-shim model use <slug>  set the Desktop default model in managed config
 codex-shim codex -- <args>   exec `codex` CLI through inline shim overrides
 codex-shim app [path]        launch Codex Desktop through managed shim config
-codex-shim patch-app         patch macOS Codex Desktop picker allowlist
-codex-shim restore-app       restore macOS app.asar from patch backup
+codex-shim patch-app         patch Codex Desktop picker allowlist (macOS, or Windows with --target)
+codex-shim restore-app       restore app.asar from patch backup (macOS, or Windows with --target)
 
 codex-app [path]             shortcut for `codex-shim app`
 codex-model [list|<slug>]    shortcut for `codex-shim model …`
@@ -910,8 +952,9 @@ Global flags:
 - `--settings <path>`: used by catalog/model/start/app/codex/doctor flows.
 - `--port <port>`: used by daemon/provider/doctor flows.
 
-`patch-app` and `restore-app` always target `/Applications/Codex.app`, do not
-use `--settings`, and exit with a clear error on Windows/Linux.
+On macOS, `patch-app` and `restore-app` target `/Applications/Codex.app`. On
+Windows, pass `--target <path>` to point at a non-MSIX Codex Desktop
+installation. They do not use `--settings`.
 
 ---
 
@@ -975,6 +1018,9 @@ server is reachable.
   path. BYOK routes get normal function-tool translation.
 - The `bin/codex-app` and `bin/codex-model` shortcuts are POSIX shell scripts.
   In native Windows shells, use the installed `codex-shim` command instead.
+- The Windows picker patch requires a non-MSIX Codex Desktop install (portable
+  or vaportail-extracted). MSIX packages at `C:\Program Files\WindowsApps` are
+  read-only and cannot be patched.
 
 ---
 
@@ -1109,6 +1155,18 @@ or the patch hit the wrong JavaScript bundle. Restore and retry:
 codex-shim restore-app
 codex-shim patch-app
 ```
+
+### Windows picker patch fails
+
+**"npx not found":** Install Node.js (`winget install OpenJS.NodeJS` or from
+https://nodejs.org). The patch uses `npx` to run `@electron/asar`.
+
+**"MSIX detected":** Run `patch-app --target <path>` against a non-MSIX Codex
+Desktop install. MSIX packages are read-only. Use the vaportail workaround (see
+Windows picker patch section above) to extract a portable copy.
+
+**Patch lost after Codex update:** Updates replace `app.asar`. Re-run
+`codex-shim patch-app --target <path>`.
 
 ### Reset generated shim state
 

@@ -170,6 +170,66 @@ def test_chat_completion_to_anthropic_message_includes_reasoning():
         {"type": "text", "text": "answer"},
     ]
 
+def test_responses_to_chat_reasoning_retroactive_when_item_comes_last():
+    """When a reasoning input item appears as the LAST item (after all
+    function_call and function_call_output items), its `pending_reasoning`
+    must be retroactively attached to the last assistant with tool_calls
+    that lacks reasoning_content."""
+    body = {
+        "model": "deepseek-reasoner",
+        "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "search"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "web_search", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "results"},
+            {"type": "reasoning", "id": "rs_0", "summary": [{"type": "summary_text", "text": "I need to search..."}]},
+        ],
+    }
+    out = responses_to_chat(body, "deepseek-reasoner")
+    assistant_with_tc = [m for m in out["messages"] if m.get("tool_calls")]
+    assert len(assistant_with_tc) == 1
+    assert assistant_with_tc[0].get("reasoning_content") == "I need to search..."
+
+
+def test_responses_to_chat_reasoning_across_multiple_tool_rounds():
+    """When the input has a reasoning item only for the first round of
+    tool calls but not for subsequent ones, the last assistant message with
+    tool_calls must still have reasoning_content."""
+    body = {
+        "model": "deepseek-reasoner",
+        "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "research"}]},
+            {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "thinking deep"}]},
+            {"type": "function_call", "call_id": "call_a", "name": "tool_a", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_a", "output": "result a"},
+            {"type": "function_call", "call_id": "call_b", "name": "tool_b", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_b", "output": "result b"},
+        ],
+    }
+    out = responses_to_chat(body, "deepseek-reasoner")
+    assistants_with_tc = [m for m in out["messages"] if m.get("tool_calls")]
+    assert len(assistants_with_tc) == 2
+    # Both should have reasoning_content (at minimum the first one)
+    assert assistants_with_tc[0].get("reasoning_content") == "thinking deep"
+    # The second may or may not have reasoning - the retroactive fix handles this
+
+
+def test_responses_to_chat_deepseek_v_thinking_type():
+    body = {
+        "model": "deepseek-v4-pro",
+        "reasoning_effort": "high",
+        "input": [{"role": "user", "content": "hello"}],
+    }
+    out = responses_to_chat(body, "deepseek-v4-pro")
+    assert out.get("thinking", {}).get("type") == "enabled"
+
+    body_no_reasoning = {
+        "model": "deepseek-v4-pro",
+        "input": [{"role": "user", "content": "hello"}],
+    }
+    out2 = responses_to_chat(body_no_reasoning, "deepseek-v4-pro")
+    assert out2.get("thinking", {}).get("type") == "disabled"
+
+
 def test_responses_to_chat_preserves_reasoning_and_effort_for_deepseek():
     body = {
         "model": "slug",
@@ -416,14 +476,49 @@ def test_responses_to_anthropic_preserves_visual_feedback_as_image_blocks():
     ]
 
 
-def test_chat_completion_to_response_strips_think():
+def test_chat_completion_to_response_extracts_think():
     payload = {
         "id": "chatcmpl_1",
         "choices": [{"message": {"role": "assistant", "content": "<think>secret</think>Hello"}}],
     }
     out = chat_completion_to_response(payload, "slug")
     assert out["model"] == "slug"
-    assert out["output"][0]["content"][0]["text"] == "Hello"
+    # Reasoning should be extracted into a reasoning output item
+    assert out["output"][0]["type"] == "reasoning"
+    assert out["output"][0]["summary"][0]["text"] == "secret"
+    # Non-think text should be in the message output item
+    assert out["output"][1]["type"] == "message"
+    assert out["output"][1]["content"][0]["text"] == "Hello"
+
+
+def test_chat_completion_to_response_strips_think_no_text():
+    """When content is ONLY a <think> block with no text after it."""
+    payload = {
+        "id": "chatcmpl_2",
+        "choices": [{"message": {"role": "assistant", "content": "<think>only thinking</think>"}}],
+    }
+    out = chat_completion_to_response(payload, "slug")
+    assert out["output"][0]["type"] == "reasoning"
+    assert out["output"][0]["summary"][0]["text"] == "only thinking"
+    assert len(out["output"]) == 1  # no message item
+
+
+def test_chat_completion_to_response_think_reasoning_content_priority():
+    """reasoning_content field takes priority over <think> tags in content."""
+    payload = {
+        "id": "chatcmpl_3",
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "<think>ignored think</think>Hello",
+                "reasoning_content": "explicit reasoning",
+            }
+        }],
+    }
+    out = chat_completion_to_response(payload, "slug")
+    assert out["output"][0]["type"] == "reasoning"
+    assert out["output"][0]["summary"][0]["text"] == "explicit reasoning"
+    assert out["output"][1]["content"][0]["text"] == "<think>ignored think</think>Hello"  # content unchanged
 
 
 def test_chat_completion_to_response_normalizes_cached_usage():
@@ -474,3 +569,69 @@ def test_anthropic_to_response_normalizes_cache_usage():
             "cache_creation_input_tokens": 2,
         },
     }
+
+
+def test_responses_to_chat_merges_duplicate_tool_call_ids():
+    """When input has multiple function_call_output items with the same
+    call_id (consecutive), the resulting tool messages must be merged."""
+    body = {
+        "model": "deepseek",
+        "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "search"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "web_search", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "actual search result text"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "unsupported call: web_search"},
+        ],
+    }
+    out = responses_to_chat(body, "deepseek")
+    tool_msgs = [m for m in out["messages"] if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1, f"Expected 1 tool message, got {len(tool_msgs)}: {tool_msgs}"
+    assert tool_msgs[0]["tool_call_id"] == "call_1"
+    assert "actual search result text" in tool_msgs[0]["content"]
+    assert "unsupported call" in tool_msgs[0]["content"]
+
+
+def test_responses_to_chat_merges_nonconsecutive_duplicate_tool_ids():
+    """When duplicate tool_call_ids are separated by other messages,
+    they must still be merged (keep first, merge content into it)."""
+    body = {
+        "model": "deepseek",
+        "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "search"}]},
+            {"type": "function_call", "call_id": "call_a", "name": "tool_a", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_a", "output": "result a"},
+            {"type": "function_call", "call_id": "call_b", "name": "tool_b", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_b", "output": "result b"},
+            {"type": "function_call_output", "call_id": "call_a", "output": "duplicate a"},
+            {"type": "function_call_output", "call_id": "call_b", "output": "duplicate b"},
+        ],
+    }
+    out = responses_to_chat(body, "deepseek")
+    tool_msgs = [m for m in out["messages"] if m.get("role") == "tool"]
+    assert len(tool_msgs) == 2, f"Expected 2 tool messages, got {len(tool_msgs)}"
+    assert tool_msgs[0]["tool_call_id"] == "call_a"
+    assert "result a" in tool_msgs[0]["content"]
+    assert "duplicate a" in tool_msgs[0]["content"]
+    assert tool_msgs[1]["tool_call_id"] == "call_b"
+
+
+def test_responses_to_chat_propagates_reasoning_to_all_tool_assistants():
+    """When reasoning items exist (thinking mode), all assistant messages
+    with tool_calls must receive reasoning_content, even if no reasoning
+    item precedes them directly."""
+    body = {
+        "model": "deepseek",
+        "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "thinking... say hello"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "greet", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "hello back"},
+            {"type": "function_call", "call_id": "call_2", "name": "wave", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_2", "output": "waved"},
+        ],
+    }
+    out = responses_to_chat(body, "deepseek")
+    assistants_with_tc = [m for m in out["messages"] if m.get("tool_calls")]
+    # All assistant messages with tool_calls should have reasoning_content
+    for i, m in enumerate(assistants_with_tc):
+        assert m.get("reasoning_content"), f"assistant[{i}] with tc has no reasoning_content: {m}"

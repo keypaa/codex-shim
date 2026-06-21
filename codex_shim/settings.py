@@ -10,6 +10,7 @@ from typing import Any
 
 DEFAULT_SETTINGS = Path.home() / ".codex-shim" / "models.json"
 DEFAULT_CURSOR_API_KEY_FILE = Path.home() / ".codex-shim" / "cursor-api-key"
+DEFAULT_DOTENV_PATH = Path.home() / ".codex-shim" / ".env"
 DEFAULT_CODEX_AUTH = Path.home() / ".codex" / "auth.json"
 DEFAULT_CODEX_MODELS_CACHE = Path.home() / ".codex" / "models_cache.json"
 DEFAULT_HOST = "127.0.0.1"
@@ -34,6 +35,38 @@ FALLBACK_CHATGPT_DISPLAY_NAMES = {
     "gpt-5.2": "gpt-5.2",
     "codex-auto-review": "Codex Auto Review",
 }
+
+
+def load_dotenv(path: Path | None = None) -> Path | None:
+    """Load a ``KEY=VALUE`` env file into ``os.environ`` (does not overwrite existing).
+
+    Looks for ``~/.codex-shim/.env`` by default. Returns the path if loaded,
+    ``None`` if the file doesn't exist.
+    """
+    env_path = Path(path or DEFAULT_DOTENV_PATH).expanduser()
+    if not env_path.is_file():
+        return None
+    try:
+        raw = env_path.read_bytes()
+    except OSError:
+        return None
+    # Detect encoding by BOM: UTF-16 (0xFFFE or 0xFEFF) or UTF-8 w/ BOM (0xEFBBBF)
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        text = raw.decode("utf-16")
+    else:
+        text = raw.decode("utf-8-sig")
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip("\"'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+    return env_path
 
 
 def chatgpt_passthrough_available(auth_path: Path | None = None) -> bool:
@@ -118,7 +151,7 @@ def load_chatgpt_passthrough_catalog_models(cache_path: Path | None = None) -> l
     path = Path(cache_path or DEFAULT_CODEX_MODELS_CACHE).expanduser()
     if path.exists():
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             data = None
         if isinstance(data, dict):
@@ -179,6 +212,7 @@ class ShimModel:
     max_context_limit: int | None = None
     max_output_tokens: int | None = None
     no_image_support: bool = False
+    no_auth: bool = False
     extra_headers: dict[str, str] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -250,6 +284,7 @@ class ModelSettings:
                     max_context_limit=_int_or_none(_field(row, "max_context_limit", "maxContextLimit")),
                     max_output_tokens=_int_or_none(_field(row, "max_output_tokens", "maxOutputTokens")),
                     no_image_support=bool(_field(row, "no_image_support", "noImageSupport", default=False)),
+                    no_auth=bool(_field(row, "no_auth", default=False)),
                     extra_headers=extra_headers,
                     raw=row,
                 )
@@ -390,4 +425,4 @@ def available_model_slugs(models: list[ShimModel]) -> set[str]:
 
 
 def byok_model_has_credentials(model: ShimModel) -> bool:
-    return bool(model.api_key.strip())
+    return bool(model.api_key.strip()) or model.no_auth

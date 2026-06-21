@@ -26,3 +26,7 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+
+# Planner / orchestrator working artifacts
+.omo/
+.sisyphus/

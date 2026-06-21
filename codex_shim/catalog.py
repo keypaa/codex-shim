@@ -19,13 +19,116 @@ from .cursor_passthrough import cursor_catalog_entry, cursor_passthrough_availab
 
 PLAN_TIERS = ["free", "plus", "pro", "team", "business", "enterprise"]
 
+_PROMPTS_CACHE: dict | None = None
+
+
+def _gpt55_prompt(model_name: str) -> dict:
+    global _PROMPTS_CACHE
+    if _PROMPTS_CACHE is None:
+        path = Path(__file__).parent / "ocfree_prompts.json"
+        _PROMPTS_CACHE = json.loads(path.read_text(encoding="utf-8"))
+    p = _PROMPTS_CACHE
+    return {
+        "base_instructions": p["base_instructions"],
+        "model_messages": {
+            "instructions_template": p["instructions_template"],
+            "instructions_variables": {
+                "personality_default": p["personality_default"],
+                "personality_friendly": p["personality_friendly"],
+                "personality_pragmatic": p["personality_pragmatic"],
+            },
+        },
+    }
+
+
+SHIM_OVERRIDES: dict[str, dict] = {
+    "ocfree-deepseek-v4-flash-free": {
+        "context_window": 200_000,
+        "max_context_window": 200_000,
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "Faster, lighter reasoning"},
+            {"effort": "medium", "description": "Balanced speed and reasoning"},
+            {"effort": "high", "description": "Deeper reasoning"},
+            {"effort": "max", "description": "Maximum reasoning where supported"},
+        ],
+        "input_modalities": ["text"],
+        "supports_image_detail_original": False,
+    },
+    "ocfree-big-pickle": {
+        "context_window": 200_000,
+        "max_context_window": 200_000,
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "Faster, lighter reasoning"},
+        ],
+        "input_modalities": ["text"],
+        "supports_image_detail_original": False,
+    },
+    "ocfree-mimo-v2-5-free": {
+        "context_window": 200_000,
+        "max_context_window": 200_000,
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "Faster, lighter reasoning"},
+            {"effort": "medium", "description": "Balanced speed and reasoning"},
+            {"effort": "high", "description": "Deeper reasoning"},
+        ],
+        "input_modalities": ["text", "audio", "video", "image"],
+        "supports_image_detail_original": True,
+    },
+    "ocfree-nemotron-3-ultra-free": {
+        "context_window": 1_000_000,
+        "max_context_window": 1_000_000,
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "Faster, lighter reasoning"},
+            {"effort": "medium", "description": "Balanced speed and reasoning"},
+            {"effort": "high", "description": "Deeper reasoning"},
+        ],
+        "input_modalities": ["text"],
+        "supports_image_detail_original": False,
+    },
+    "ocfree-north-mini-code-free": {
+        "context_window": 256_000,
+        "max_context_window": 256_000,
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "Faster, lighter reasoning"},
+            {"effort": "medium", "description": "Balanced speed and reasoning"},
+            {"effort": "high", "description": "Deeper reasoning"},
+        ],
+        "input_modalities": ["text"],
+        "supports_image_detail_original": False,
+    },
+    "tr-minimax-m3": {
+        "context_window": 128_000,
+        "max_context_window": 128_000,
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "Faster, lighter reasoning"},
+            {"effort": "medium", "description": "Balanced speed and reasoning"},
+            {"effort": "high", "description": "Deeper reasoning"},
+        ],
+        "input_modalities": ["text", "image"],
+        "supports_image_detail_original": True,
+    },
+}
+
+_USE_GPT55_PROMPT = set(SHIM_OVERRIDES.keys())
+
+
+def _apply_overrides(entry: dict, slug: str) -> dict:
+    overrides = SHIM_OVERRIDES.get(slug)
+    if overrides:
+        entry.update(overrides)
+    if slug in _USE_GPT55_PROMPT:
+        prompt = _gpt55_prompt(entry.get("display_name", slug))
+        entry["base_instructions"] = prompt["base_instructions"]
+        entry["model_messages"] = prompt["model_messages"]
+    return entry
+
 
 def catalog_entry(model: ShimModel) -> dict:
     context = model.max_context_limit or _default_context(model)
     compact = max(8_000, int(context * 0.8))
     truncation = min(64_000, max(8_000, int(context * 0.32)))
     reasoning = _reasoning_effort(model)
-    return {
+    entry = {
         "slug": model.slug,
         "display_name": model.display_name,
         "description": f"{model.display_name} via local Codex shim.",
@@ -47,7 +150,7 @@ def catalog_entry(model: ShimModel) -> dict:
         "support_verbosity": False,
         "apply_patch_tool_type": "freeform",
         "web_search_tool_type": "text_and_image",
-        "supports_search_tool": False,
+        "supports_search_tool": True,
         "supports_parallel_tool_calls": True,
         "experimental_supported_tools": [],
         "input_modalities": ["text"] if model.no_image_support else ["text", "image"],
@@ -70,6 +173,7 @@ def catalog_entry(model: ShimModel) -> dict:
             "instructions_variables": {"model_name": model.display_name},
         },
     }
+    return _apply_overrides(entry, model.slug)
 
 
 def chatgpt_passthrough_entries() -> list[dict]:

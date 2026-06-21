@@ -168,7 +168,7 @@ def test_missing_api_key_is_warn(tmp_path, capsys):
 def test_no_proxy_complete_is_ok(monkeypatch, tmp_path, capsys):
     settings = _settings(tmp_path / "models.json", [])
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost,::1")
-    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost,::1")
 
     code = cli.main(["--settings", str(settings), "doctor"])
 

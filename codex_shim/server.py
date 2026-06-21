@@ -8,7 +8,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncGenerator
 from urllib.parse import urljoin
 
 from aiohttp import ClientSession, ClientTimeout, web
@@ -40,6 +40,7 @@ from .settings import (
     byok_model_has_credentials,
     chatgpt_upstream_model,
     is_chatgpt_passthrough_slug,
+    load_dotenv,
     usable_byok_models,
 )
 from .translate import (
@@ -51,11 +52,16 @@ from .translate import (
     chat_completion_to_response,
     chat_to_anthropic,
     normalize_responses_usage,
+    process_chat_completion_response,
+    process_chat_stream_chunk,
     responses_to_anthropic,
     responses_to_chat,
     _chat_finish_to_anthropic_stop,
     _responses_usage_to_anthropic_usage,
 )
+
+# Load ~/.codex-shim/.env into os.environ before any request handler runs.
+load_dotenv()
 
 DEBUG_DIR = Path(__file__).resolve().parents[1] / ".codex-shim"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
@@ -240,6 +246,7 @@ class ShimServer:
     async def responses(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
         _log_incoming_request("/v1/responses", body)
+        _dump_debug_request("inbound", "/v1/responses", body)
         body = await self._maybe_apply_auto_router(body)
         model = str(body.get("model") or "")
         if is_chatgpt_passthrough_slug(model):
@@ -262,7 +269,7 @@ class ShimServer:
             return await self._chatgpt_passthrough(request, body, response_model_override=model)
         route = self._route(body)
         if route.is_openai_chat:
-            forwarded = responses_to_chat(body, route.model)
+            forwarded = responses_to_chat(body, route.model, route.provider)
             return await self._post_openai_chat(request, route, forwarded, as_responses=True)
         if route.is_anthropic:
             forwarded = responses_to_anthropic(body, route.model, route.max_output_tokens)
@@ -294,7 +301,7 @@ class ShimServer:
         route = self._route(body)
         compact_body = _compact_request_body(body, route.model)
         if route.is_openai_chat:
-            forwarded = responses_to_chat(compact_body, route.model)
+            forwarded = responses_to_chat(compact_body, route.model, route.provider)
             forwarded["stream"] = False
             response = await self._post_openai_chat(request, route, forwarded, as_responses=True)
             return await _as_compact_response(response, route.slug)
@@ -763,9 +770,11 @@ class ShimServer:
         if as_responses:
             tool_types = _build_tool_types(body)
             payload = chat_completion_to_response(payload, route.slug, tool_types)
-            intercepted = _maybe_intercept_web_search(payload)
+            intercepted = await _maybe_intercept_web_search(payload)
             return web.json_response(intercepted or payload)
+        process_chat_completion_response(payload)
         return web.json_response(payload)
+
 
     async def _post_openai_chat_as_anthropic(
         self, request: web.Request, route: ShimModel, body: dict[str, Any]
@@ -797,7 +806,7 @@ class ShimServer:
         if as_responses:
             tool_types = _build_tool_types(body)
             payload = anthropic_to_response(payload, route.slug, tool_types)
-            intercepted = _maybe_intercept_web_search(payload)
+            intercepted = await _maybe_intercept_web_search(payload)
             return web.json_response(intercepted or payload)
         return web.json_response(anthropic_to_chat_response(payload, route.slug))
 
@@ -822,11 +831,14 @@ class ShimServer:
     ) -> web.StreamResponse:
         response = _sse_response()
         await response.prepare(request)
+        state = None
+        think_state: dict[str, str | None] = {}  # shared across chunks for split tags
         if as_responses:
             tool_types = _build_tool_types(body) if body else {}
             state = ResponsesStreamState(route.slug, tool_types)
         try:
             if as_responses:
+                assert state is not None
                 await state.start(response)
             async for line in _sse_lines(upstream):
                 if line == "[DONE]":
@@ -836,10 +848,13 @@ class ShimServer:
                 except json.JSONDecodeError:
                     continue
                 if as_responses:
+                    assert state is not None
                     await state.write_chat_delta(response, event)
                 else:
+                    process_chat_stream_chunk(event, think_state)
                     await _write_sse(response, event)
             if as_responses:
+                assert state is not None
                 await state.finish(response)
             else:
                 await _safe_write(response, b"data: [DONE]\n\n")
@@ -885,11 +900,13 @@ class ShimServer:
     ) -> web.StreamResponse:
         response = _sse_response()
         await response.prepare(request)
+        state = None
         if as_responses:
             tool_types = _build_tool_types(body) if body else {}
             state = ResponsesStreamState(route.slug, tool_types)
         try:
             if as_responses:
+                assert state is not None
                 await state.start(response)
             async for line in _sse_lines(upstream):
                 if line == "[DONE]":
@@ -899,10 +916,12 @@ class ShimServer:
                 except json.JSONDecodeError:
                     continue
                 if as_responses:
+                    assert state is not None
                     await state.write_anthropic_delta(response, event)
                 else:
                     await _write_sse(response, _anthropic_stream_to_chat_chunk(event, route.slug))
             if as_responses:
+                assert state is not None
                 await state.finish(response)
             else:
                 await _safe_write(response, b"data: [DONE]\n\n")
@@ -1225,13 +1244,32 @@ class ResponsesStreamState:
         self.message_opened = False
         self.message_closed = False
         self.usage: dict[str, Any] | None = None
-        self.tool_calls: dict[int, dict[str, Any]] = {}
+        self.tool_calls: dict[int | tuple[str, int], dict[str, Any]] = {}
         self.reasoning_blocks: dict[Any, dict[str, Any]] = {}
         self.next_output_index = 0
         # Map sanitized tool name -> original Responses tool type so we can
         # emit the correct output item type (e.g. custom_tool_call for freeform
         # apply_patch instead of generic function_call).
         self.tool_types = tool_types or {}
+        # Known reasoning/thinking tag pairs. Must match translate.py THINK_TAG_PAIRS.
+        # Used by _process_content_with_think to detect and extract reasoning
+        # blocks from streaming content deltas.
+        self._think_tag_pairs: list[tuple[str, str]] = [
+            ("<think>", "</think>"),
+            ("<mm:think>", "</mm:think>"),
+            ("<thinking>", "</thinking>"),
+            ("<reason>", "</reason>"),
+            ("<reasoning>", "</reasoning>"),
+            ("<thought>", "</thought>"),
+            ("[THINK]", "[/THINK]"),
+            ("\u25c1think\u25b7", "\u25c1/think\u25b7"),
+        ]
+        # When inside a think block across streaming chunks, stores the closing
+        # tag we're waiting for (e.g. "</think>"). None when not in a block.
+        self._in_think_block: str | None = None
+        # Accumulated function_call_output items from server-side web search
+        # execution, included in the final response.completed payload.
+        self.web_search_results: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1254,6 +1292,77 @@ class ResponsesStreamState:
     # ------------------------------------------------------------------
     # Chat-completions (OpenAI-style) deltas
     # ------------------------------------------------------------------
+    async def _close_open_reasoning(self, response: web.StreamResponse) -> None:
+        """Close all open (in-progress) reasoning blocks."""
+        for state in list(self.reasoning_blocks.values()):
+            if not state.get("closed"):
+                await self._close_reasoning(response, state)
+
+    async def _process_content_with_think(self, response: web.StreamResponse, content: str) -> None:
+        """Extract reasoning blocks from streaming content deltas.
+
+        Upstream models sometimes emit chain-of-thought reasoning as tagged
+        blocks inside the ``content`` field of streaming chat-completion deltas
+        (e.g. ``<think>...</think>``, ``<mm:think>...</mm:think>``,
+        ``<thinking>...</thinking>``, ``[THINK]...[/THINK]``,
+        ``\u25c1think\u25b7...\u25c1/think\u25b7``, etc.).
+
+        This method finds the earliest opening tag, sends the reasoning text
+        via ``_chat_reasoning_delta`` (proper ``reasoning_summary_text.delta``
+        SSE events), and sends only the non-reasoning text as normal
+        ``output_text.delta`` events.
+
+        Tracks ``self._in_think_block`` (the close tag we are waiting for)
+        across streaming chunks so tags split across multiple deltas work.
+        """
+        remaining = content
+        pairs = self._think_tag_pairs
+
+        while remaining:
+            if self._in_think_block is not None:
+                # Inside a think block — look for its closing tag
+                closing_tag = self._in_think_block
+                closing_idx = remaining.find(closing_tag)
+                if closing_idx >= 0:
+                    think_text = remaining[:closing_idx]
+                    if think_text:
+                        await self._chat_reasoning_delta(response, think_text)
+                    self._in_think_block = None
+                    # Reasoning block is done — close it before any text
+                    await self._close_open_reasoning(response)
+                    remaining = remaining[closing_idx + len(closing_tag):]
+                    # Continue loop (may be more think tags or text)
+                else:
+                    # Still inside — send as reasoning delta
+                    await self._chat_reasoning_delta(response, remaining)
+                    return
+            else:
+                # Outside any think block — look for the earliest opening tag
+                best_pos = len(remaining) + 1
+                best_open: str | None = None
+                best_close: str | None = None
+                for open_tag, close_tag in pairs:
+                    pos = remaining.find(open_tag)
+                    if pos >= 0 and pos < best_pos:
+                        best_pos = pos
+                        best_open = open_tag
+                        best_close = close_tag
+
+                if best_open is not None:
+                    if best_pos > 0:
+                        # Text before the opening tag — send as normal text
+                        await self._close_open_reasoning(response)
+                        await self._text_delta(response, remaining[:best_pos])
+                    self._in_think_block = best_close
+                    remaining = remaining[best_pos + len(best_open):]
+                    # Continue loop to check for the close tag immediately
+                else:
+                    # No opening tag — send everything as normal text
+                    if remaining:
+                        await self._close_open_reasoning(response)
+                        await self._text_delta(response, remaining)
+                    return
+
     async def write_chat_delta(self, response: web.StreamResponse, chunk: dict[str, Any]) -> None:
         usage = chunk.get("usage")
         if isinstance(usage, dict):
@@ -1265,16 +1374,13 @@ class ResponsesStreamState:
             await self._chat_reasoning_delta(response, reasoning)
         content = delta.get("content")
         if content:
-            for state in list(self.reasoning_blocks.values()):
-                if not state.get("closed"):
-                    await self._close_reasoning(response, state)
-            await self._text_delta(response, content)
+            await self._process_content_with_think(response, content)
         for call in delta.get("tool_calls") or []:
             await self._chat_tool_delta(response, call)
 
     async def _chat_reasoning_delta(self, response: web.StreamResponse, text: str) -> None:
         state = self.reasoning_blocks.get(("chat",))
-        if state is None:
+        if state is None or state.get("closed"):
             state = await self._open_reasoning(response, key=("chat",))
         state["text"] += text
         await _write_sse(
@@ -1509,8 +1615,6 @@ class ResponsesStreamState:
         output_type = "function_call"
         if original_type == "apply_patch":
             output_type = "custom_tool_call"
-        elif original_type.startswith("web_search"):
-            output_type = "web_search_call"
         state: dict[str, Any] = {
             "id": call_id,
             "call_id": call_id,
@@ -1555,6 +1659,77 @@ class ResponsesStreamState:
                 "type": "response.output_item.done",
                 "output_index": state["output_index"],
                 "item": self._tool_item(state, "completed"),
+            },
+        )
+        # Intercept web_search: execute search server-side and emit
+        # function_call_output — the shim runs the search for BYOK models.
+        # Detection is by tool name, not output_type, because we always
+        # emit function_call (not web_search_call) to avoid Codex Desktop
+        # ending the turn trying to handle it natively.
+        if state.get("name") == "web_search":
+            await self._emit_web_search_result(response, state)
+
+    async def _emit_web_search_result(
+        self, response: web.StreamResponse, state: dict[str, Any]
+    ) -> None:
+        """Execute a web search server-side and emit a function_call_output item.
+
+        Called from _close_tool when tool name is 'web_search'. Runs the search via
+        run_in_executor to avoid blocking the async event loop with the
+        synchronous urllib request in _perform_web_search.
+        """
+        import asyncio
+        import json
+
+        try:
+            args = json.loads(state.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            args = {}
+        query = args.get("query") or ""
+
+        # Run the synchronous web search (urllib) in a thread pool executor
+        # to avoid blocking the async event loop.
+        loop = asyncio.get_event_loop()
+        result_text = await loop.run_in_executor(
+            None, lambda q=query: asyncio.run(_perform_web_search(q))
+        )
+
+        output_index = self.next_output_index
+        self.next_output_index += 1
+        result_id = f"wso_{state['call_id']}_{int(time.time() * 1000)}"
+
+        result_item: dict[str, Any] = {
+            "id": result_id,
+            "type": "function_call_output",
+            "status": "completed",
+            "call_id": state["call_id"],
+            "output": result_text,
+            "output_index": output_index,
+        }
+        self.web_search_results.append(result_item)
+
+        # Emit response.output_item.added (placeholder with empty output)
+        await _write_sse(
+            response,
+            {
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {
+                    "id": result_id,
+                    "type": "function_call_output",
+                    "status": "in_progress",
+                    "call_id": state["call_id"],
+                    "output": "",
+                },
+            },
+        )
+        # Emit response.output_item.done (completed with actual search text)
+        await _write_sse(
+            response,
+            {
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": result_item,
             },
         )
 
@@ -1690,6 +1865,8 @@ class ResponsesStreamState:
                 collected.append((self.message_index, self._message_item("completed")))
             for state in self.tool_calls.values():
                 collected.append((state["output_index"], self._tool_item(state, "completed")))
+            for result in self.web_search_results:
+                collected.append((result["output_index"], result))
             collected.sort(key=lambda pair: pair[0])
             output = [item for _, item in collected]
         payload = {
@@ -1756,129 +1933,228 @@ def _build_tool_types(body: dict[str, Any]) -> dict[str, str]:
         clean = re.sub(r"[^a-zA-Z0-9_-]+", "_", name.strip())[:64].strip("_")
         if clean:
             tool_types[clean] = tool_type
+            # Native tools (web_search_preview, computer_use_preview) are
+            # renamed during responses_to_chat() translation (e.g. to the
+            # function name "web_search").  Also map the translated name so
+            # _open_tool and chat_completion_to_response can look up the
+            # original type when the upstream model responds with it.
+            if tool_type.startswith("web_search") and clean != "web_search":
+                tool_types["web_search"] = tool_type
     return tool_types
 
+def _format_search_results(results: list[dict[str, str]]) -> str:
+    """Format a list of ``{"title": ..., "url": ...}`` dicts into a text block."""
+    lines: list[str] = []
+    for r in results:
+        title = r.get("title", "").strip().replace("\n", " ")
+        url = r.get("url", "").strip()
+        if not title and not url:
+            continue
+        if title:
+            lines.append(title)
+        if url:
+            lines.append(url)
+    return "\n\n".join(lines) if lines else ""
+
+
+_LANGSEARCH_URL = "https://api.langsearch.com/v1/web-search"
+
+
+async def _run_langsearch(query: str, api_key: str) -> list[dict[str, str]] | None:
+    """Search via LangSearch API. Returns None on failure.
+
+    Note: count and summary params are intentionally omitted — they trigger
+    a server-side 500 error on the LangSearch API.
+    """
+    try:
+        async with ClientSession() as session:
+            async with session.post(
+                _LANGSEARCH_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"query": query},
+                timeout=ClientTimeout(total=20),
+            ) as resp:
+                resp.raise_for_status()
+                body = await resp.json()
+        # LangSearch wraps results under body["data"]["webPages"]["value"]
+        top_data = body.get("data") or {}
+        pages = (top_data.get("webPages") or {}).get("value") or []
+        return [
+            {"title": p.get("name", ""), "url": p.get("url", "")}
+            for p in pages
+            if p.get("name") and p.get("url")
+        ][:10]
+    except Exception:
+        return None
+
+
 async def _perform_web_search(query: str) -> str:
-    """Execute a web search via DuckDuckGo and return text results.
+    """Execute a web search via LangSearch (primary) or DuckDuckGo (fallback)
+    and return formatted text results.
 
     This is a server-side fallback for custom models whose provider does not
     have a native web-search capability.  Codex Desktop expects the shim to
-    return results as a `function_call_output` (or `web_search_call`) item;
-    when the model is BYOK, the Desktop app does not execute the search itself,
-    so the shim must do it and feed the results back into the conversation.
-    """
-    import urllib.parse
-    import urllib.request
+    return results as a ``function_call_output`` item; when the model is BYOK,
+    the Desktop app does not execute the search itself, so the shim must do it
+    and feed the results back into the conversation.
 
-    if not query or not query.strip():
+    Search provider priority:
+      1. LangSearch API (when ``LANGSEARCH_API_KEY`` env var is set)
+         https://langsearch.com — free tier: 1 000 queries/day, no credit card
+      2. DuckDuckGo via ddgs / primp / urllib (fallback)
+    """
+    import asyncio
+    import os
+
+    query = query.strip()
+    if not query:
         return "No search query provided."
 
-    # DuckDuckGo lite HTML endpoint (no API key required)
-    url = (
-        "https://html.duckduckgo.com/html/"
-        + "?q="
-        + urllib.parse.quote_plus(query.strip())
-    )
-    req = urllib.request.Request(
-        url,
-        headers={
+    # Strategy 0: LangSearch API (when LANGSEARCH_API_KEY is set)
+    api_key = os.environ.get("LANGSEARCH_API_KEY", "").strip()
+    if api_key:
+        try:
+            raw = await _run_langsearch(query, api_key)
+            if raw is not None:
+                formatted = _format_search_results(raw)
+                if formatted:
+                    return formatted
+        except Exception:
+            pass  # LangSearch failed; fall through to DuckDuckGo
+
+    # Strategy 1: Use ddgs library (handles TLS fingerprinting, proxy rotation)
+    try:
+        from ddgs import DDGS
+
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(
+            None, lambda: list(DDGS().text(query.strip(), max_results=5))
+        )
+        results: list[str] = []
+        for r in raw:
+            title = (r.get("title") or "").strip().replace("\n", " ")
+            snippet = (r.get("body") or "").strip().replace("\n", " ")
+            if title:
+                entry = title
+                if snippet:
+                    entry += "\n" + snippet
+                results.append(entry)
+        if results:
+            return "\n\n".join(results)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # Strategy 2: primp + regex parsing fallback
+    try:
+        import primp
+        import re
+
+        client = primp.Client(headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0.0.0 Safari/537.36"
-        },
-    )
+        })
+        url = f"https://lite.duckduckgo.com/lite/?q={__import__('urllib.parse').quote_plus(query.strip())}"
+
+        loop = asyncio.get_event_loop()
+        resp = await loop.run_in_executor(None, lambda: client.get(url))
+        html = resp.text
+
+        if "anomaly" not in html and "challenge-form" not in html:
+            results = []
+            for m in re.finditer(
+                r'<a[^>]*href="(//duckduckgo\.com/l/[^"]*)"[^>]*>(.*?)</a>',
+                html, re.DOTALL,
+            ):
+                title = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+                if not title:
+                    continue
+                after_link = html[m.end(): m.end() + 500]
+                snippet = ""
+                for snip_match in re.finditer(
+                    r'(?:<br\s*/?>\s*|\n\s*)([A-Z][^<]{10,300}?)(?:<|$)',
+                    after_link,
+                ):
+                    candidate = snip_match.group(1).strip()
+                    if candidate and len(candidate) > 10 and "//duckduckgo.com" not in candidate:
+                        snippet = candidate
+                        break
+                entry = title
+                if snippet:
+                    entry += "\n" + snippet
+                results.append(entry)
+                if len(results) >= 5:
+                    break
+            if results:
+                return "\n\n".join(results)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # Strategy 3: urllib + regex fallback
     try:
+        import re
+        import urllib.parse
+        import urllib.request
+
+        url = f"https://lite.duckduckgo.com/lite/?q={urllib.parse.quote_plus(query.strip())}"
+        ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/120.0.0.0 Safari/537.36")
+        req = urllib.request.Request(url, headers={"User-Agent": ua})
         with urllib.request.urlopen(req, timeout=10) as resp:
             html = resp.read().decode("utf-8", errors="replace")
+
+        if "anomaly" not in html and "challenge-form" not in html:
+            results = []
+            for m in re.finditer(
+                r'<a[^>]*href="(//duckduckgo\.com/l/[^"]*)"[^>]*>(.*?)</a>',
+                html, re.DOTALL,
+            ):
+                title = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+                if not title:
+                    continue
+                after_link = html[m.end(): m.end() + 500]
+                snippet = ""
+                for snip_match in re.finditer(
+                    r'(?:<br\s*/?>\s*|\n\s*)([A-Z][^<]{10,300}?)(?:<|$)',
+                    after_link,
+                ):
+                    candidate = snip_match.group(1).strip()
+                    if candidate and len(candidate) > 10 and "//duckduckgo.com" not in candidate:
+                        snippet = candidate
+                        break
+                entry = title
+                if snippet:
+                    entry += "\n" + snippet
+                results.append(entry)
+                if len(results) >= 5:
+                    break
+            if results:
+                return "\n\n".join(results)
     except Exception as exc:
         return f"Web search failed: {exc}"
 
-    # Extract title + snippet from result links
-    results: list[str] = []
-    # Each result is in a `.result` div with `.result__a` (title/link) and `.result__snippet`
-    from html.parser import HTMLParser
+    return "No web search results found."
 
-    class _ResultParser(HTMLParser):
-        def __init__(self) -> None:
-            super().__init__()
-            self.in_result = False
-            self.in_a = False
-            self.in_snippet = False
-            self.current_title = ""
-            self.current_snippet = ""
-            self.results: list[dict[str, str]] = []
-            self._tag_stack: list[str] = []
-            self._class_stack: list[str] = []
-
-        def _current_class(self) -> str:
-            return self._class_stack[-1] if self._class_stack else ""
-
-        def handle_starttag(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> None:
-            attrs = dict(attrs_list)
-            cls = (attrs.get("class") or "").lower()
-            self._tag_stack.append(tag)
-            self._class_stack.append(cls)
-            if "result" in cls and tag == "div":
-                self.in_result = True
-                self.current_title = ""
-                self.current_snippet = ""
-            if self.in_result and tag == "a" and "result__a" in cls:
-                self.in_a = True
-            if self.in_result and ("result__snippet" in cls or "result__body" in cls):
-                self.in_snippet = True
-
-        def handle_endtag(self, tag: str) -> None:
-            if self._tag_stack and self._tag_stack[-1] == tag:
-                self._tag_stack.pop()
-                self._class_stack.pop()
-            if tag == "div" and self.in_result:
-                if self.current_title or self.current_snippet:
-                    self.results.append(
-                        {
-                            "title": self.current_title.strip(),
-                            "snippet": self.current_snippet.strip(),
-                        }
-                    )
-                self.in_result = False
-            if tag == "a":
-                self.in_a = False
-            if tag in {"div", "span", "p"}:
-                self.in_snippet = False
-
-        def handle_data(self, data: str) -> None:
-            if self.in_a:
-                self.current_title += data
-            if self.in_snippet:
-                self.current_snippet += data
-
-    parser = _ResultParser()
-    parser.feed(html)
-    for r in parser.results[:5]:
-        title = r["title"].replace("\n", " ")
-        snippet = r["snippet"].replace("\n", " ")
-        if title and snippet:
-            results.append(f"{title}\n{snippet}")
-        elif title:
-            results.append(title)
-        elif snippet:
-            results.append(snippet)
-
-    if not results:
-        return "No web search results found."
-    return "\n\n".join(results)
-
-def _maybe_intercept_web_search(payload: dict[str, Any]) -> dict[str, Any] | None:
-    """If the response payload contains a web_search_call, execute it server-side
+async def _maybe_intercept_web_search(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """If the response payload contains a web_search function_call, execute it server-side
     and return a new payload with the results embedded as a function_call_output.
 
-    Returns None if no web_search_call is present (pass through unchanged).
+    Returns None if no web_search function_call is present (pass through unchanged).
     """
     output = payload.get("output") or []
     if not isinstance(output, list):
         return None
     search_calls: list[tuple[int, dict[str, Any]]] = []
     for i, item in enumerate(output):
-        if isinstance(item, dict) and item.get("type") == "web_search_call":
+        if isinstance(item, dict) and item.get("name") == "web_search" and item.get("type") == "function_call":
             search_calls.append((i, item))
     if not search_calls:
         return None
@@ -1891,12 +2167,9 @@ def _maybe_intercept_web_search(payload: dict[str, Any]) -> dict[str, Any] | Non
         except json.JSONDecodeError:
             args = {}
         query = args.get("query") or ""
-        # Run the search synchronously (non-streaming path only)
-        import asyncio
         try:
-            loop = asyncio.get_running_loop()
-            result_text = loop.run_until_complete(_perform_web_search(query))
-        except RuntimeError:
+            result_text = await _perform_web_search(query)
+        except Exception:
             result_text = "Web search unavailable in this context."
         results.append({
             "id": f"wso_{call.get('call_id', '0')}",
@@ -1909,7 +2182,7 @@ def _maybe_intercept_web_search(payload: dict[str, Any]) -> dict[str, Any] | Non
     # Replace web_search_call items with their results
     new_output: list[dict[str, Any]] = []
     for i, item in enumerate(output):
-        if isinstance(item, dict) and item.get("type") == "web_search_call":
+        if isinstance(item, dict) and item.get("name") == "web_search" and item.get("type") == "function_call":
             # Find matching result
             for r in results:
                 if r.get("call_id") == item.get("call_id"):
@@ -1941,7 +2214,7 @@ def _join_url(base_url: str, endpoint: str) -> str:
 
 def _openai_headers(route: ShimModel) -> dict[str, str]:
     headers = {"Content-Type": "application/json", **route.extra_headers}
-    if route.api_key:
+    if route.api_key and not route.no_auth:
         headers.setdefault("Authorization", f"Bearer {route.api_key}")
     return headers
 
@@ -1952,7 +2225,7 @@ def _anthropic_headers(route: ShimModel) -> dict[str, str]:
         "anthropic-version": "2023-06-01",
         **route.extra_headers,
     }
-    if route.api_key:
+    if route.api_key and not route.no_auth:
         headers.setdefault("x-api-key", route.api_key)
     return headers
 
@@ -2063,7 +2336,7 @@ def _log_incoming_request(endpoint: str, body: dict[str, Any]) -> None:
         print(f"[req] failed to log: {exc}", flush=True)
 
 
-async def _sse_lines(upstream) -> Any:
+async def _sse_lines(upstream) -> AsyncGenerator[str, None]:
     buffer = b""
     async for chunk in upstream.content.iter_chunked(4096):
         buffer += chunk
@@ -2105,7 +2378,7 @@ def _default_compact_instructions() -> str:
     )
 
 
-async def _as_compact_response(response: web.StreamResponse, model: str) -> web.Response:
+async def _as_compact_response(response: web.StreamResponse, model: str) -> web.StreamResponse:
     if not isinstance(response, web.Response) or response.status >= 400:
         return response
     try:
@@ -2167,6 +2440,12 @@ async def _error_response(upstream, *, slug: str | None = None) -> web.Response:
             f"[err] upstream {slug} returned {upstream.status}: {text[:500]}",
             flush=True,
         )
+    try:
+        error_path = DEBUG_DIR / "last_error.json"
+        error_path.parent.mkdir(parents=True, exist_ok=True)
+        error_path.write_text(json.dumps({"status": upstream.status, "slug": slug, "body": text[:10000]}, indent=2))
+    except OSError as exc:
+        print(f"[err] failed to write last_error.json: {exc}", flush=True)
     return web.Response(status=upstream.status, text=text, content_type=upstream.content_type or "text/plain")
 
 

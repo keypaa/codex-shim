@@ -61,14 +61,14 @@ def test_chat_completion_to_response_apply_patch_custom_tool_call():
     tool_types = {"apply_patch": "apply_patch"}
     response = chat_completion_to_response(payload, "model", tool_types)
     output = response["output"]
-    call_items = [o for o in output if o["type"] in ("function_call", "custom_tool_call", "web_search_call")]
+    call_items = [o for o in output if o["type"] in ("function_call", "custom_tool_call")]
     assert len(call_items) == 1
     assert call_items[0]["type"] == "custom_tool_call"
     assert call_items[0]["name"] == "apply_patch"
 
 
 def test_chat_completion_to_response_web_search_call():
-    """web_search tool type maps to web_search_call output item."""
+    """web_search tool type maps to function_call output item."""
     payload = {
         "choices": [
             {
@@ -87,9 +87,9 @@ def test_chat_completion_to_response_web_search_call():
     tool_types = {"web_search": "web_search"}
     response = chat_completion_to_response(payload, "model", tool_types)
     output = response["output"]
-    call_items = [o for o in output if o["type"] in ("function_call", "custom_tool_call", "web_search_call")]
+    call_items = [o for o in output if o["type"] in ("function_call", "custom_tool_call")]
     assert len(call_items) == 1
-    assert call_items[0]["type"] == "web_search_call"
+    assert call_items[0]["type"] == "function_call"
     assert call_items[0]["name"] == "web_search"
 
 
@@ -113,7 +113,7 @@ def test_chat_completion_to_response_unknown_tool_function_call():
     tool_types = {"random_tool": "mcp__random"}
     response = chat_completion_to_response(payload, "model", tool_types)
     output = response["output"]
-    call_items = [o for o in output if o["type"] in ("function_call", "custom_tool_call", "web_search_call")]
+    call_items = [o for o in output if o["type"] in ("function_call", "custom_tool_call")]
     assert len(call_items) == 1
     assert call_items[0]["type"] == "function_call"
     assert call_items[0]["name"] == "random_tool"
@@ -131,7 +131,7 @@ def test_anthropic_to_response_with_tool_types():
     tool_types = {"apply_patch": "apply_patch"}
     response = anthropic_to_response(payload, "model", tool_types)
     output = response["output"]
-    call_items = [o for o in output if o["type"] in ("function_call", "custom_tool_call", "web_search_call")]
+    call_items = [o for o in output if o["type"] in ("function_call", "custom_tool_call")]
     assert len(call_items) == 1
     assert call_items[0]["type"] == "custom_tool_call"
 
@@ -155,6 +155,6 @@ def test_chat_completion_to_response_no_tool_types_backward_compat():
     }
     response = chat_completion_to_response(payload, "model")
     output = response["output"]
-    call_items = [o for o in output if o["type"] in ("function_call", "custom_tool_call", "web_search_call")]
+    call_items = [o for o in output if o["type"] in ("function_call", "custom_tool_call")]
     assert len(call_items) == 1
     assert call_items[0]["type"] == "function_call"

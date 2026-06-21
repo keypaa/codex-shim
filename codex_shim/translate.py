@@ -5,7 +5,40 @@ import re
 from typing import Any
 
 
-THINK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+# Known reasoning/thinking tag pairs used by various models.
+# Each tuple is (open_tag, close_tag). When adding new pairs here, keep
+# server.py's _think_tag_pairs (in ResponsesStreamState) in sync.
+THINK_TAG_PAIRS: list[tuple[str, str]] = [
+    # DeepSeek R1/V3, Qwen3, MiniMax M2/M2.5
+    ("<think>", "</think>"),
+    # MiniMax M3
+    ("<mm:think>", "</mm:think>"),
+    # Various models using full-word variants
+    ("<thinking>", "</thinking>"),
+    ("<reason>", "</reason>"),
+    ("<reasoning>", "</reasoning>"),
+    ("<thought>", "</thought>"),
+    # Bracket-style (some community models)
+    ("[THINK]", "[/THINK]"),
+    # Pipe-style Unicode (Kimi K2: \u25c1 = ◁, \u25b7 = ▷)
+    ("\u25c1think\u25b7", "\u25c1/think\u25b7"),
+]
+
+# Pre-compiled patterns: one per tag pair, group(1) = captured reasoning text.
+_THINK_PATTERNS: list[re.Pattern] = [
+    re.compile(re.escape(open_tag) + r"(.*?)" + re.escape(close_tag), re.IGNORECASE | re.DOTALL)
+    for open_tag, close_tag in THINK_TAG_PAIRS
+]
+
+# Legacy single-regex convenience for callers that just need tag removal.
+# Matches any known think tag pair with captured content in group(1) per pattern.
+_THINK_LEGACY = re.compile(
+    "|".join(
+        re.escape(open_tag) + r"(.*?)" + re.escape(close_tag)
+        for open_tag, close_tag in THINK_TAG_PAIRS
+    ),
+    re.IGNORECASE | re.DOTALL,
+)
 
 SHIM_ENCRYPTED_CONTENT_PREFIX = "anthropic-thinking-v1:"
 _THINKING_MAGIC = SHIM_ENCRYPTED_CONTENT_PREFIX
@@ -27,24 +60,64 @@ def _decode_thinking_blob(encoded: Any) -> dict[str, Any] | None:
     return data
 
 
-def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, Any]:
+def responses_to_chat(body: dict[str, Any], upstream_model: str, provider: str = "") -> dict[str, Any]:
     messages = []
     instructions = body.get("instructions")
     if instructions:
         messages.append({"role": "system", "content": _content_to_text(instructions)})
     pending_reasoning: str | None = None
+    has_reasoning = False
     for m in _responses_input_to_messages(body.get("input")):
         if m.get("_reasoning_only"):
             summary = m.get("summary") or []
             text = " ".join(item.get("text", "") for item in summary if isinstance(item, dict))
             if text:
                 pending_reasoning = text
+                has_reasoning = True
             continue
         if pending_reasoning and m.get("role") == "assistant":
             m["reasoning_content"] = pending_reasoning
             pending_reasoning = None
         messages.append(m)
+    # If reasoning was never attached (e.g., the reasoning item came after
+    # tool call output items in the input), try retroactively attaching it
+    # to the last assistant message that has tool_calls.
+    if pending_reasoning:
+        for m in reversed(messages):
+            if m.get("role") == "assistant" and m.get("tool_calls") and not m.get("reasoning_content"):
+                m["reasoning_content"] = pending_reasoning
+                break
     messages = _sanitize_chat_messages(_merge_consecutive_messages(_normalize_chat_roles(messages)))
+
+    # Deduplicate tool messages by tool_call_id. The Responses API may include
+    # multiple function_call_output items for the same call (e.g., a text result
+    # followed by an "unsupported call" diagnostic). Chat Completions requires
+    # each tool_call_id to appear exactly once. Merge content into first.
+    seen_tool_ids: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for m in messages:
+        if m.get("role") == "tool" and m.get("tool_call_id"):
+            tci: str = m["tool_call_id"]
+            if tci in seen_tool_ids:
+                for existing in deduped:
+                    if existing.get("role") == "tool" and existing.get("tool_call_id") == tci:
+                        existing["content"] = _merge_chat_content(existing.get("content"), m.get("content"))
+                        break
+                continue
+            seen_tool_ids.add(tci)
+        deduped.append(m)
+    messages = deduped
+
+    # Propagate reasoning_content: if the conversation has reasoning items
+    # (model is in thinking mode), ensure ALL assistant messages with tool_calls
+    # have reasoning_content. DeepSeek V-series requires this for round-trips.
+    if has_reasoning:
+        last_rc: str | None = None
+        for m in messages:
+            if m.get("role") == "assistant" and m.get("reasoning_content"):
+                last_rc = m["reasoning_content"]
+            elif m.get("role") == "assistant" and m.get("tool_calls") and not m.get("reasoning_content") and last_rc:
+                m["reasoning_content"] = last_rc
 
     chat: dict[str, Any] = {
         "model": upstream_model,
@@ -55,8 +128,23 @@ def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, An
     _copy_if_present(body, chat, "top_p")
     _copy_if_present(body, chat, "max_output_tokens", "max_tokens")
     _copy_if_present(body, chat, "max_tokens")
-    _copy_if_present(body, chat, "parallel_tool_calls")
+    # parallel_tool_calls is only forwarded for native OpenAI providers;
+    # generic-compatible APIs (generic-chat-completion-api, ollama, etc.)
+    # may reject this parameter with a 422 error.
+    if provider == "openai":
+        _copy_if_present(body, chat, "parallel_tool_calls")
     _copy_if_present(body, chat, "reasoning_effort")
+
+    # DeepSeek V-series models (v4-pro, v4-flash, etc.) use "thinking.type"
+    # instead of OpenRouter's "reasoning" parameter. Without explicit control,
+    # thinking defaults to enabled, generating reasoning_content even when
+    # not requested, which can cause 400 errors on tool-call round-trips if
+    # the generated content isn't later forwarded.
+    if upstream_model and ("deepseek-v" in upstream_model.lower()):
+        thinking_enabled = chat.get("reasoning_effort") not in (None, "none")
+        chat["thinking"] = {
+            "type": "enabled" if thinking_enabled else "disabled",
+        }
 
     tools = _responses_tools_to_chat_tools(body.get("tools"))
     if tools:
@@ -319,7 +407,18 @@ def chat_completion_to_response(payload: dict[str, Any], requested_model: str, t
     choice = (payload.get("choices") or [{}])[0]
     message = choice.get("message") or {}
     output: list[dict[str, Any]] = []
-    reasoning = message.get("reasoning_content")
+    reasoning = message.get("reasoning_content") or message.get("reasoning")
+    content_raw = message.get("content") or ""
+
+    # If no structured reasoning_content, check for think/reason tags in content
+    if not reasoning:
+        for pat in _THINK_PATTERNS:
+            think_match = pat.search(content_raw)
+            if think_match:
+                reasoning = think_match.group(1)
+                content_raw = pat.sub("", content_raw)
+                break
+
     if reasoning:
         output.append(
             {
@@ -329,15 +428,14 @@ def chat_completion_to_response(payload: dict[str, Any], requested_model: str, t
                 "summary": [{"type": "summary_text", "text": reasoning}],
             }
         )
-    text = strip_think(message.get("content") or "")
-    if text:
+    if content_raw:
         output.append(
             {
                 "id": "msg_0",
                 "type": "message",
                 "status": "completed",
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": text, "annotations": []}],
+                "content": [{"type": "output_text", "text": content_raw, "annotations": []}],
             }
         )
     tool_types = tool_types or {}
@@ -348,8 +446,6 @@ def chat_completion_to_response(payload: dict[str, Any], requested_model: str, t
         item_type = "function_call"
         if original_type == "apply_patch":
             item_type = "custom_tool_call"
-        elif original_type.startswith("web_search"):
-            item_type = "web_search_call"
         output.append(
             {
                 "id": call.get("id", "call_0"),
@@ -445,7 +541,108 @@ def _int_token(value: Any) -> int | None:
 
 
 def strip_think(text: str) -> str:
-    return THINK_RE.sub("", text or "")
+    return _THINK_LEGACY.sub("", text or "")
+
+
+def process_chat_stream_chunk(chunk: dict, state: dict[str, str | None]) -> dict:
+    """Strip think/reason tags from a streaming chat-completion chunk.
+
+    Handles tags that span multiple chunks using ``state["in_think_block"]``.
+    Sets ``delta.reasoning_content`` with the extracted reasoning text and
+    cleans ``delta.content``. Mutates *chunk* in place and returns it.
+
+    ``state`` should be a dict shared across calls (same HTTP stream). It is
+    mutated with the current block state.
+
+    Tag pairs used: ``THINK_TAG_PAIRS`` (supports ``<think>``, ``<mm:think>``,
+    ``<thinking>``, ``<reason>``, ``<reasoning>``, ``<thought>``, ``[THINK]``,
+    ``\u25c1think\u25b7``).
+    """
+    choices = chunk.get("choices") or []
+    if not choices:
+        return chunk
+    delta = choices[0].get("delta") or {}
+    raw = delta.get("content") or ""
+    if not raw:
+        return chunk
+
+    remaining = raw
+    reasoning_parts: list[str] = []
+    clean_parts: list[str] = []
+    in_block: str | None = state.get("in_think_block")
+    pairs = THINK_TAG_PAIRS
+
+    while remaining:
+        if in_block is not None:
+            close_tag = in_block
+            idx = remaining.find(close_tag)
+            if idx >= 0:
+                text = remaining[:idx]
+                if text:
+                    reasoning_parts.append(text)
+                in_block = None
+                remaining = remaining[idx + len(close_tag):]
+            else:
+                reasoning_parts.append(remaining)
+                remaining = ""
+        else:
+            best_pos = len(remaining) + 1
+            best_open: str | None = None
+            best_close: str | None = None
+            for open_tag, close_tag in pairs:
+                pos = remaining.find(open_tag)
+                if pos >= 0 and pos < best_pos:
+                    best_pos = pos
+                    best_open = open_tag
+                    best_close = close_tag
+            if best_open is not None:
+                if best_pos > 0:
+                    clean_parts.append(remaining[:best_pos])
+                in_block = best_close
+                remaining = remaining[best_pos + len(best_open):]
+            else:
+                if remaining:
+                    clean_parts.append(remaining)
+                remaining = ""
+
+    state["in_think_block"] = in_block
+
+    reasoning = "".join(reasoning_parts)
+    clean = "".join(clean_parts)
+
+    if reasoning:
+        existing = delta.get("reasoning_content") or ""
+        delta["reasoning_content"] = (existing + reasoning) if existing else reasoning
+    if clean:
+        delta["content"] = clean
+    elif "content" in delta:
+        # All content consumed by reasoning — remove content key
+        delta.pop("content", None)
+
+    return chunk
+
+
+def process_chat_completion_response(data: dict) -> dict:
+    """Strip think/reason tags from a non-streaming chat-completion response.
+
+    Extracts the first block of tagged reasoning text into
+    ``message.reasoning_content`` and removes the tags from
+    ``message.content``. If ``reasoning_content`` is already set, does nothing.
+    """
+    for choice in data.get("choices") or []:
+        message = choice.get("message") or {}
+        content = message.get("content") or ""
+        if not content:
+            continue
+        if message.get("reasoning_content") or message.get("reasoning"):
+            continue  # Already has structured reasoning
+        for pat in _THINK_PATTERNS:
+            m = pat.search(content)
+            if m:
+                message["reasoning_content"] = m.group(1)
+                message["content"] = pat.sub("", content)
+                break
+    return data
 
 
 def _responses_input_to_messages(value: Any) -> list[dict[str, Any]]:
@@ -1145,15 +1342,21 @@ def _merge_consecutive_messages(messages: list[dict[str, Any]]) -> list[dict[str
     for message in messages:
         current = dict(message)
         role = current.get("role")
-        if merged and role == merged[-1].get("role") and role in {"system", "user", "assistant"}:
+        if merged and role == merged[-1].get("role") and role in {"system", "user", "assistant", "tool"}:
             previous = merged[-1]
-            previous["content"] = _merge_chat_content(previous.get("content"), current.get("content"))
-            if role == "assistant":
-                if current.get("reasoning_content") and not previous.get("reasoning_content"):
-                    previous["reasoning_content"] = current["reasoning_content"]
-                tool_calls = list(previous.get("tool_calls") or []) + list(current.get("tool_calls") or [])
-                if tool_calls:
-                    previous["tool_calls"] = tool_calls
+            if role == "tool":
+                if current.get("tool_call_id") == previous.get("tool_call_id"):
+                    previous["content"] = _merge_chat_content(previous.get("content"), current.get("content"))
+                else:
+                    merged.append(current)
+            else:
+                previous["content"] = _merge_chat_content(previous.get("content"), current.get("content"))
+                if role == "assistant":
+                    if current.get("reasoning_content") and not previous.get("reasoning_content"):
+                        previous["reasoning_content"] = current["reasoning_content"]
+                    tool_calls = list(previous.get("tool_calls") or []) + list(current.get("tool_calls") or [])
+                    if tool_calls:
+                        previous["tool_calls"] = tool_calls
             continue
         merged.append(current)
     return merged

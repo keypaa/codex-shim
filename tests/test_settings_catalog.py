@@ -4,11 +4,15 @@ import json
 import hashlib
 import plistlib
 import struct
+from pathlib import Path
 
 import pytest
 
+from codex_shim.desktop_patch import windows as windows_module
+
 from codex_shim import cli
 from codex_shim.catalog import catalog_entry, write_catalog
+from codex_shim.opencode_free import opencode_free_model_row, write_opencode_free_models
 from codex_shim.opencode_go import opencode_go_model_row, write_opencode_go_models
 from codex_shim.settings import ModelSettings, chatgpt_passthrough_available, FALLBACK_CHATGPT_PASSTHROUGH_SLUGS
 
@@ -262,6 +266,163 @@ def test_refresh_opencode_go_cli_writes_discovered_models(monkeypatch, tmp_path,
     ]
 
 
+def test_opencode_free_model_row_prefers_chat_and_prefixes_slug():
+    row = opencode_free_model_row(
+        "gpt-5.3-codex",
+        chat_status=200,
+        messages_status=200,
+        base_url="https://opencode.ai/zen/v1",
+    )
+
+    assert row == {
+        "slug": "ocfree-gpt-5-3-codex",
+        "model": "gpt-5.3-codex",
+        "display_name": "OpenCode Free Gpt 5.3 Codex",
+        "provider": "generic-chat-completion-api",
+        "base_url": "https://opencode.ai/zen/v1",
+        "api_key": "",
+        "no_auth": True,
+        "no_image_support": True,
+        "generated_by": "codex-shim opencode-free refresh",
+    }
+
+
+def test_opencode_free_model_row_uses_messages_when_chat_fails():
+    row = opencode_free_model_row(
+        "qwen3.7-max",
+        chat_status=401,
+        messages_status=200,
+        base_url="https://opencode.ai/zen/v1",
+    )
+
+    assert row["slug"] == "ocfree-qwen3-7-max"
+    assert row["provider"] == "anthropic"
+    assert row["api_key"] == ""
+    assert row["no_auth"] is True
+
+
+def test_opencode_free_model_row_returns_none_when_both_endpoints_fail():
+    row = opencode_free_model_row(
+        "unknown-model",
+        chat_status=404,
+        messages_status=404,
+        base_url="https://opencode.ai/zen/v1",
+    )
+
+    assert row is None
+
+
+def test_write_opencode_free_models_replaces_previous_generated_rows(tmp_path):
+    settings = tmp_path / "models.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {"model": "manual", "provider": "openai", "base_url": "http://manual/v1", "api_key": "k"},
+                    {
+                        "slug": "ocfree-old",
+                        "model": "old",
+                        "provider": "generic-chat-completion-api",
+                        "base_url": "https://opencode.ai/zen/v1",
+                        "generated_by": "codex-shim opencode-free refresh",
+                    },
+                ]
+            }
+        )
+    )
+
+    write_opencode_free_models(
+        settings,
+        [
+            opencode_free_model_row(
+                "gpt-5.3-codex",
+                chat_status=200,
+                messages_status=200,
+                base_url="https://opencode.ai/zen/v1",
+            )
+        ],
+    )
+    models = ModelSettings(settings).load()
+
+    assert [model.slug for model in models] == ["manual", "ocfree-gpt-5-3-codex"]
+    assert [model.no_auth for model in models] == [False, True]
+
+
+def test_write_opencode_free_models_preserves_legacy_custom_models_key(tmp_path):
+    settings = tmp_path / "models.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "customModels": [
+                    {"model": "legacy", "provider": "openai", "baseUrl": "http://legacy/v1", "apiKey": "k"},
+                ]
+            }
+        )
+    )
+
+    write_opencode_free_models(
+        settings,
+        [
+            opencode_free_model_row(
+                "gpt-5.3-codex",
+                chat_status=200,
+                messages_status=200,
+                base_url="https://opencode.ai/zen/v1",
+            )
+        ],
+    )
+
+    on_disk = json.loads(settings.read_text())
+    assert "customModels" in on_disk
+    assert "models" not in on_disk
+    assert [row["model"] for row in on_disk["customModels"]] == ["legacy", "gpt-5.3-codex"]
+
+
+def test_refresh_opencode_free_cli_writes_discovered_models(monkeypatch, tmp_path, capsys):
+    settings = tmp_path / "models.json"
+    monkeypatch.setattr("codex_shim.opencode_free.fetch_opencode_free_model_ids", lambda *_args, **_kwargs: ["gpt-5.3-codex", "qwen3.7-max"])
+    monkeypatch.setattr("codex_shim.opencode_free.probe_chat_model", lambda _base, model, **_kwargs: 401 if model == "qwen3.7-max" else 200)
+    monkeypatch.setattr("codex_shim.opencode_free.probe_messages_model", lambda _base, _model, **_kwargs: 200)
+
+    assert cli.main(["--settings", str(settings), "opencode-free", "refresh"]) == 0
+
+    out = capsys.readouterr().out
+    assert "Refreshed 2 OpenCode Free models" in out
+    assert "ocfree-gpt-5-3-codex" in out
+    assert "ocfree-qwen3-7-max" in out
+    models = ModelSettings(settings).load()
+    assert [(model.slug, model.provider, model.no_auth, model.api_key) for model in models] == [
+        ("ocfree-gpt-5-3-codex", "generic-chat-completion-api", True, ""),
+        ("ocfree-qwen3-7-max", "anthropic", True, ""),
+    ]
+
+
+def test_opencode_free_model_with_no_auth_is_usable_without_api_key(tmp_path):
+    """OpenCode Free models have no_auth=True and empty api_key,
+    so byok_model_has_credentials should return True even though api_key is empty."""
+    settings = tmp_path / "models.json"
+    settings.write_text(
+        json.dumps({
+            "models": [{
+                "slug": "ocfree-gpt-5-3-codex",
+                "model": "gpt-5.3-codex",
+                "display_name": "OpenCode Free GPT 5.3 Codex",
+                "provider": "generic-chat-completion-api",
+                "base_url": "https://opencode.ai/zen/v1",
+                "api_key": "",
+                "no_auth": True,
+                "no_image_support": True,
+            }]
+        })
+    )
+
+    from codex_shim.settings import byok_model_has_credentials
+    [model] = ModelSettings(settings).load()
+    assert model.api_key == ""
+    assert model.no_auth is True
+    assert byok_model_has_credentials(model) is True
+
+
 def test_ollama_launch_models_schema_loads(tmp_path):
     settings = tmp_path / "ollama-launch-models.json"
     settings.write_text(
@@ -470,16 +631,18 @@ def test_loopback_no_proxy_adds_upper_and_lowercase_entries():
 
 def test_patch_app_fails_off_macos(monkeypatch, capsys):
     monkeypatch.setattr(cli.sys, "platform", "win32")
+    monkeypatch.setattr("codex_shim.desktop_patch.windows.find_codex_install", lambda target=None: None)
 
     assert cli.patch_codex_app() == 1
-    assert "macOS-only" in capsys.readouterr().err
+    assert "Codex Desktop not found" in capsys.readouterr().err
 
 
 def test_restore_app_fails_off_macos(monkeypatch, capsys):
     monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setattr("codex_shim.desktop_patch.windows.find_codex_install", lambda target=None: None)
 
     assert cli.restore_codex_app_bundle() == 1
-    assert "macOS-only" in capsys.readouterr().err
+    assert "Codex Desktop not found" in capsys.readouterr().err
 
 
 def _make_picker_bundle(
@@ -593,6 +756,192 @@ def test_update_app_asar_integrity_uses_asar_json_header_hash(tmp_path):
 
     data = plistlib.loads(info_plist.read_bytes())
     assert data["ElectronAsarIntegrity"]["Resources/app.asar"]["hash"] == hashlib.sha256(header_json).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Windows patch detection and lifecycle tests
+# ---------------------------------------------------------------------------
+
+
+def test_find_codex_install_msix(monkeypatch):
+    """find_codex_install returns the MSIX path when MSIX install is detected."""
+    msix_path = Path("C:/Program Files/WindowsApps/OpenAI.Codex_1.0.0.0")
+    monkeypatch.setattr(windows_module, "_find_msix_install", lambda: msix_path)
+    monkeypatch.setattr(windows_module, "_find_msix_install_fallback", lambda: None)
+    monkeypatch.setattr(windows_module, "_get_local_appdata", lambda: None)
+
+    result = windows_module.find_codex_install()
+    assert result == msix_path
+
+
+def test_find_codex_install_target(tmp_path):
+    """find_codex_install returns the target path when it points to a valid install."""
+    (tmp_path / "Codex.exe").write_text("dummy")
+    resources = tmp_path / "resources"
+    resources.mkdir()
+    header = b'{"files":{"webview":{}}}'
+    (resources / "app.asar").write_bytes(
+        struct.pack("<4I", 4, len(header), 0, len(header)) + header
+    )
+
+    result = windows_module.find_codex_install(target=str(tmp_path))
+    assert result == tmp_path
+
+
+def test_find_codex_install_not_found(monkeypatch):
+    """find_codex_install returns None when no Codex install is found."""
+    monkeypatch.setattr(windows_module, "_find_msix_install", lambda: None)
+    monkeypatch.setattr(windows_module, "_find_msix_install_fallback", lambda: None)
+    monkeypatch.setattr(windows_module, "_get_local_appdata", lambda: None)
+
+    result = windows_module.find_codex_install()
+    assert result is None
+
+
+def test_is_msix_readonly_true():
+    """is_msix_readonly returns True for paths under WindowsApps."""
+    assert (
+        windows_module.is_msix_readonly(
+            Path("C:/Program Files/WindowsApps/OpenAI.Codex_1.0.0.0")
+        )
+        is True
+    )
+
+
+def test_is_msix_readonly_false(tmp_path):
+    """is_msix_readonly returns False for a regular writable path."""
+    assert windows_module.is_msix_readonly(tmp_path) is False
+
+
+def test_validate_codex_install_valid(tmp_path):
+    """validate_codex_install returns True for a properly structured Codex install."""
+    (tmp_path / "Codex.exe").write_text("dummy")
+    resources = tmp_path / "resources"
+    resources.mkdir()
+    header = b'{"files":{"webview":{}}}'
+    (resources / "app.asar").write_bytes(
+        struct.pack("<4I", 4, len(header), 0, len(header)) + header
+    )
+
+    assert windows_module.validate_codex_install(tmp_path) is True
+
+
+def test_validate_codex_install_invalid(tmp_path):
+    """validate_codex_install returns False for an empty/invalid directory."""
+    assert windows_module.validate_codex_install(tmp_path) is False
+
+
+def test_patch_app_windows_non_msix(monkeypatch, tmp_path, capsys):
+    """Patch pipeline succeeds on a non-MSIX Windows Codex install."""
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+
+    install_path = tmp_path / "Codex"
+    install_path.mkdir()
+    (install_path / "Codex.exe").write_text("dummy")
+    resources = install_path / "resources"
+    resources.mkdir()
+    header = b'{"files":{"webview":{}}}'
+    (resources / "app.asar").write_bytes(
+        struct.pack("<4I", 4, len(header), 0, len(header)) + header
+    )
+
+    monkeypatch.setattr(
+        "codex_shim.desktop_patch.windows.find_codex_install",
+        lambda target=None: install_path,
+    )
+    monkeypatch.setattr(
+        "codex_shim.desktop_patch.windows.is_msix_readonly", lambda path: False
+    )
+    monkeypatch.setattr(cli, "_app_asar_is_patched", lambda _: False)
+    monkeypatch.setattr(
+        "codex_shim.desktop_patch.windows.quit_codex_app_windows",
+        lambda force=True: False,
+    )
+    monkeypatch.setattr(
+        "codex_shim.desktop_patch.windows.update_app_asar_integrity_windows",
+        lambda a, b: None,
+    )
+    def _mock_subprocess(*a, **kw):
+        args = a[0] if a else kw.get("args", [])
+        if len(args) >= 6 and args[3] == "extract":
+            extract_dir = Path(args[5])
+            js_file = extract_dir / "test.js"
+            js_file.parent.mkdir(parents=True, exist_ok=True)
+            js_file.write_text("x = y && z !== `amazonBedrock`\nmodelProviders:null")
+        return type("M", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    monkeypatch.setattr("subprocess.run", _mock_subprocess)
+    monkeypatch.setattr("shutil.copy2", lambda s, d: None)
+
+    assert cli.patch_codex_app() == 0
+    assert "Patched Codex Desktop model picker" in capsys.readouterr().out
+
+
+def test_patch_app_windows_msix_refused(monkeypatch, capsys):
+    """Patch refuses when Codex is installed as a read-only MSIX package."""
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    msix_path = Path("C:/Program Files/WindowsApps/OpenAI.Codex_1.0.0.0")
+
+    monkeypatch.setattr(
+        "codex_shim.desktop_patch.windows.find_codex_install",
+        lambda target=None: msix_path,
+    )
+    monkeypatch.setattr(
+        "codex_shim.desktop_patch.windows.is_msix_readonly", lambda path: True
+    )
+
+    assert cli.patch_codex_app() == 1
+    assert "MSIX Codex Desktop install detected" in capsys.readouterr().err
+
+
+def test_restore_app_windows(monkeypatch, tmp_path, capsys):
+    """Restore succeeds on Windows when a pre-patch backup exists."""
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+
+    install_path = tmp_path / "Codex"
+    install_path.mkdir()
+    resources = install_path / "resources"
+    resources.mkdir()
+    app_asar = resources / "app.asar"
+    app_asar.write_text("patched content")
+    (resources / "app.asar.before-codex-shim-model-picker-patch").write_text(
+        "backup content"
+    )
+
+    monkeypatch.setattr(
+        "codex_shim.desktop_patch.windows.find_codex_install",
+        lambda target=None: install_path,
+    )
+    monkeypatch.setattr(
+        "codex_shim.desktop_patch.windows.is_msix_readonly", lambda path: False
+    )
+    monkeypatch.setattr(cli, "_app_asar_is_patched", lambda _: True)
+    monkeypatch.setattr("shutil.copy2", lambda s, d: None)
+
+    assert cli.restore_codex_app_bundle() == 0
+    assert "Restored original app.asar from backup" in capsys.readouterr().out
+
+
+def test_patch_app_windows_idempotent(monkeypatch, tmp_path, capsys):
+    """Patch reports already-applied when Windows Codex is already patched."""
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+
+    install_path = tmp_path / "Codex"
+    install_path.mkdir()
+    resources = install_path / "resources"
+    resources.mkdir()
+    (resources / "app.asar").write_text("content")
+
+    monkeypatch.setattr(
+        "codex_shim.desktop_patch.windows.find_codex_install",
+        lambda target=None: install_path,
+    )
+    monkeypatch.setattr(
+        "codex_shim.desktop_patch.windows.is_msix_readonly", lambda path: False
+    )
+    monkeypatch.setattr(cli, "_app_asar_is_patched", lambda _: True)
+
+    assert cli.patch_codex_app() == 0
+    assert "already applied" in capsys.readouterr().err.lower()
 
 
 class ModelSettingsFixture:
